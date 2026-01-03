@@ -1,7 +1,7 @@
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import Peer, { DataConnection } from 'peerjs';
-import { GameState, Player, Card, GamePhase, SET_LIMITS, PropertySet } from './types';
+import { GameState, Player, Card, GamePhase, SET_LIMITS, PropertySet, RENT_VALUES } from './types';
 import CardUI from './components/CardUI';
 import { INITIAL_DECK as RAW_DECK } from './constants';
 import { getAIMoves } from './services/geminiAi';
@@ -16,6 +16,9 @@ const App: React.FC = () => {
   const [joinId, setJoinId] = useState<string>('');
   const [multiStatus, setMultiStatus] = useState<string>('');
   
+  // Rent targeting state
+  const [pendingRentCard, setPendingRentCard] = useState<Card | null>(null);
+
   const peerRef = useRef<Peer | null>(null);
   const connRef = useRef<DataConnection | null>(null);
   const aiProcessingRef = useRef(false);
@@ -23,7 +26,6 @@ const App: React.FC = () => {
   // --- Multiplayer Logic ---
 
   const initMultiplayer = useCallback((mode: 'HOST' | 'JOIN') => {
-    // Generate a simple 5-char code for Peer ID
     const customId = Math.random().toString(36).substring(2, 7).toUpperCase();
     const peer = new Peer(mode === 'HOST' ? customId : undefined);
     peerRef.current = peer;
@@ -58,10 +60,7 @@ const App: React.FC = () => {
   const setupConnection = (conn: DataConnection) => {
     conn.on('open', () => {
       setMultiStatus('Connected! Starting game...');
-      if (peerId === joinId) {
-        // I am the joiner
-      } else {
-        // I am the host, initialize game
+      if (peerId !== joinId) {
         setTimeout(() => initializeGame(false, true), 1000);
       }
     });
@@ -133,14 +132,12 @@ const App: React.FC = () => {
 
   const processPayment = (fromPlayer: Player, toPlayer: Player, amount: number, log: string[]) => {
     let remaining = amount;
-    // Bank payment
     while (remaining > 0 && fromPlayer.bank.length > 0) {
       const card = fromPlayer.bank.pop()!;
       toPlayer.bank.push(card);
       remaining -= card.value;
       log.unshift(`${fromPlayer.name} paid ${card.name} (${card.value}M) from bank.`);
     }
-    // Property payment
     while (remaining > 0 && fromPlayer.properties.length > 0) {
       const setIdx = fromPlayer.properties.findIndex(p => p.cards.length > 0);
       if (setIdx === -1) break;
@@ -160,6 +157,35 @@ const App: React.FC = () => {
     }
   };
 
+  const handleRentCollection = (setIndex: number) => {
+    if (!pendingRentCard || !gameState) return;
+
+    setGameState(prev => {
+      if (!prev) return prev;
+      const newState = JSON.parse(JSON.stringify(prev)) as GameState;
+      const player = newState.players[newState.activePlayerIndex];
+      const opponent = newState.players[1 - newState.activePlayerIndex];
+      const targetSet = player.properties[setIndex];
+
+      const rentArr = RENT_VALUES[targetSet.color];
+      const count = Math.min(targetSet.cards.length, rentArr.length);
+      const rentVal = rentArr[count - 1] || 0;
+
+      newState.logs.unshift(`${player.name} collected ${rentVal}M rent for ${targetSet.color} set.`);
+      processPayment(opponent, player, rentVal, newState.logs);
+      
+      newState.discardPile.push(pendingRentCard);
+      newState.actionsRemaining -= 1;
+      
+      checkWinCondition(newState);
+      if (connRef.current) syncState(newState);
+      return newState;
+    });
+
+    setPendingRentCard(null);
+    setSelectedCardId(null);
+  };
+
   const executeMove = useCallback((type: 'BANK' | 'PROPERTY' | 'ACTION_PLAY', cardId: string) => {
     setGameState(prev => {
       if (!prev || prev.actionsRemaining <= 0 || prev.phase !== 'PLAY_PHASE' || prev.winner) return prev;
@@ -177,6 +203,7 @@ const App: React.FC = () => {
           player.hand.splice(cardIndex, 1);
           player.bank.push(card);
           newState.logs.unshift(`${player.name} banked ${card.name} (${card.value}M).`);
+          newState.actionsRemaining -= 1;
           break;
         case 'PROPERTY':
           if (card.type !== 'PROPERTY' && card.type !== 'WILD') return prev;
@@ -190,8 +217,16 @@ const App: React.FC = () => {
           set.cards.push(card);
           set.isComplete = set.cards.length >= SET_LIMITS[set.color];
           newState.logs.unshift(`${player.name} deployed ${card.name}.`);
+          newState.actionsRemaining -= 1;
           break;
         case 'ACTION_PLAY':
+          if (card.type === 'RENT') {
+            // Rent cards now go into target selection mode
+            player.hand.splice(cardIndex, 1);
+            setPendingRentCard(card);
+            return newState; // Decrement action ONLY after target chosen
+          }
+          
           player.hand.splice(cardIndex, 1);
           if (card.name === 'Pass Go') {
             const drawn = newState.deck.splice(0, 2);
@@ -201,6 +236,46 @@ const App: React.FC = () => {
             processPayment(opponent, player, 5, newState.logs);
           } else if (card.name === "It's My Birthday") {
             processPayment(opponent, player, 2, newState.logs);
+          } else if (card.name === 'Deal Breaker') {
+            const stealableSets = opponent.properties.filter(p => p.isComplete);
+            if (stealableSets.length > 0) {
+              const targetSet = stealableSets[0];
+              opponent.properties = opponent.properties.filter(p => p !== targetSet);
+              player.properties.push(targetSet);
+              newState.logs.unshift(`${player.name} played Deal Breaker: Stole a complete ${targetSet.color} set!`);
+            } else {
+              newState.logs.unshift(`${player.name} played Deal Breaker but opponent has no full sets.`);
+            }
+          } else if (card.name === 'Force Deal') {
+            const myProps = player.properties.filter(p => !p.isComplete);
+            const oppProps = opponent.properties.filter(p => !p.isComplete);
+            if (myProps.length > 0 && oppProps.length > 0) {
+              const mySet = myProps[0];
+              const oppSet = oppProps[0];
+              const myCard = mySet.cards.pop()!;
+              const oppCard = oppSet.cards.pop()!;
+              
+              if (mySet.cards.length === 0) player.properties = player.properties.filter(p => p !== mySet);
+              if (oppSet.cards.length === 0) opponent.properties = opponent.properties.filter(p => p !== oppSet);
+
+              let myTarget = player.properties.find(p => p.color === (oppCard.color || 'ANY'));
+              if (!myTarget) {
+                myTarget = { color: (oppCard.color || 'ANY') as any, cards: [], isComplete: false };
+                player.properties.push(myTarget);
+              }
+              myTarget.cards.push(oppCard);
+              myTarget.isComplete = myTarget.cards.length >= SET_LIMITS[myTarget.color];
+
+              let oppTarget = opponent.properties.find(p => p.color === (myCard.color || 'ANY'));
+              if (!oppTarget) {
+                oppTarget = { color: (myCard.color || 'ANY') as any, cards: [], isComplete: false };
+                opponent.properties.push(oppTarget);
+              }
+              oppTarget.cards.push(myCard);
+              oppTarget.isComplete = oppTarget.cards.length >= SET_LIMITS[oppTarget.color];
+
+              newState.logs.unshift(`${player.name} played Force Deal: Swapped ${myCard.name} for ${oppCard.name}.`);
+            }
           } else if (card.name === 'Sly Deal') {
             const stealableSets = opponent.properties.filter(p => !p.isComplete);
             if (stealableSets.length > 0) {
@@ -217,13 +292,13 @@ const App: React.FC = () => {
               newState.logs.unshift(`${player.name} stole ${stolen.name} with Sly Deal.`);
             }
           } else {
-            newState.discardPile.push(card);
             newState.logs.unshift(`${player.name} played ${card.name}.`);
           }
+          newState.discardPile.push(card);
+          newState.actionsRemaining -= 1;
           break;
       }
 
-      newState.actionsRemaining -= 1;
       checkWinCondition(newState);
       if (connRef.current) syncState(newState);
       return newState;
@@ -262,14 +337,13 @@ const App: React.FC = () => {
       return newState;
     });
     setSelectedCardId(null);
+    setPendingRentCard(null);
   }, []);
 
   const handleCardClick = useCallback((cardId: string) => {
-    if (gameState?.winner) return;
+    if (gameState?.winner || pendingRentCard) return;
     setSelectedCardId(prev => (prev === cardId ? null : cardId));
-  }, [gameState?.winner]);
-
-  // --- Effects ---
+  }, [gameState?.winner, pendingRentCard]);
 
   useEffect(() => {
     if (gameState?.phase === 'START_TURN') {
@@ -314,8 +388,6 @@ const App: React.FC = () => {
     }
   }, [gameState?.activePlayerIndex, gameState?.phase, executeMove, endTurn, gameState?.winner]);
 
-  // --- Rendering ---
-
   if (!gameState) {
     return (
       <div className="h-screen flex flex-col items-center justify-center bg-[#0f172a] text-white p-6 overflow-y-auto">
@@ -326,86 +398,48 @@ const App: React.FC = () => {
             <p className="text-slate-500 font-bold uppercase tracking-[0.5em] text-xs">Global Digital Edition</p>
           </div>
         </div>
-
         {lobbyMode === 'MAIN' && (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4 w-full max-w-2xl">
             <button onClick={() => initializeGame(true)} className="group relative p-6 bg-slate-800/40 border border-white/10 rounded-3xl hover:border-amber-500/50 transition duration-300 text-left">
-              <div className="w-12 h-12 bg-amber-500 rounded-2xl flex items-center justify-center mb-4 shadow-lg shadow-amber-500/20">
-                <i className="fa-solid fa-robot text-slate-900 text-xl"></i>
-              </div>
+              <div className="w-12 h-12 bg-amber-500 rounded-2xl flex items-center justify-center mb-4 shadow-lg shadow-amber-500/20"><i className="fa-solid fa-robot text-slate-900 text-xl"></i></div>
               <h3 className="text-xl font-bold mb-1">VS Gemini AI</h3>
               <p className="text-slate-500 text-sm">Challenge the advanced AI on your own.</p>
             </button>
             <button onClick={() => { setLobbyMode('HOST'); initMultiplayer('HOST'); }} className="group relative p-6 bg-slate-800/40 border border-white/10 rounded-3xl hover:border-blue-500/50 transition duration-300 text-left">
-              <div className="w-12 h-12 bg-blue-500 rounded-2xl flex items-center justify-center mb-4 shadow-lg shadow-blue-500/20">
-                <i className="fa-solid fa-earth-americas text-white text-xl"></i>
-              </div>
+              <div className="w-12 h-12 bg-blue-500 rounded-2xl flex items-center justify-center mb-4 shadow-lg shadow-blue-500/20"><i className="fa-solid fa-earth-americas text-white text-xl"></i></div>
               <h3 className="text-xl font-bold mb-1">Host Remote Game</h3>
               <p className="text-slate-500 text-sm">Create a room for your wife to join.</p>
             </button>
             <button onClick={() => setLobbyMode('JOIN')} className="group relative p-6 bg-slate-800/40 border border-white/10 rounded-3xl hover:border-emerald-500/50 transition duration-300 text-left">
-              <div className="w-12 h-12 bg-emerald-500 rounded-2xl flex items-center justify-center mb-4 shadow-lg shadow-emerald-500/20">
-                <i className="fa-solid fa-key text-white text-xl"></i>
-              </div>
+              <div className="w-12 h-12 bg-emerald-500 rounded-2xl flex items-center justify-center mb-4 shadow-lg shadow-emerald-500/20"><i className="fa-solid fa-key text-white text-xl"></i></div>
               <h3 className="text-xl font-bold mb-1">Join with Code</h3>
               <p className="text-slate-500 text-sm">Enter a room code from another player.</p>
             </button>
-            <button onClick={() => initializeGame(false)} className="group relative p-6 bg-slate-800/40 border border-white/10 rounded-3xl hover:border-slate-400/50 transition duration-300 text-left">
-              <div className="w-12 h-12 bg-slate-700 rounded-2xl flex items-center justify-center mb-4 shadow-lg">
-                <i className="fa-solid fa-users text-white text-xl"></i>
-              </div>
+            <button onClick={() => initializeGame(false)} className="group relative p-6 bg-slate-800/40 border border-white/10 rounded-3xl hover:border-purple-500/50 transition duration-300 text-left">
+              <div className="w-12 h-12 bg-purple-500 rounded-2xl flex items-center justify-center mb-4 shadow-lg shadow-purple-500/20"><i className="fa-solid fa-users text-white text-xl"></i></div>
               <h3 className="text-xl font-bold mb-1">Local 2 Player</h3>
               <p className="text-slate-500 text-sm">Pass and play on the same device.</p>
             </button>
-          </div>
-        )}
-
-        {lobbyMode === 'HOST' && (
-          <div className="max-w-md w-full bg-slate-800/50 border border-white/10 p-8 rounded-[2.5rem] text-center animate-in zoom-in duration-300">
-             <div className="w-16 h-16 bg-blue-500/20 rounded-full flex items-center justify-center mx-auto mb-6 relative">
-                <div className="pulse-ring"></div>
-                <i className="fa-solid fa-broadcast-tower text-blue-400 text-2xl"></i>
-             </div>
-             <h2 className="text-2xl font-black mb-2 uppercase tracking-tight">Your Room Code</h2>
-             <div className="bg-slate-900 py-4 px-8 rounded-2xl border border-blue-500/30 text-4xl font-black tracking-[0.5em] text-blue-400 mb-6 font-mono">
-               {peerId || '...'}
-             </div>
-             <p className="text-slate-400 text-sm mb-8">{multiStatus}</p>
-             <button onClick={() => { peerRef.current?.destroy(); setLobbyMode('MAIN'); }} className="w-full py-4 bg-slate-700 hover:bg-slate-600 rounded-2xl font-bold transition">CANCEL</button>
-          </div>
-        )}
-
-        {lobbyMode === 'JOIN' && (
-          <div className="max-w-md w-full bg-slate-800/50 border border-white/10 p-8 rounded-[2.5rem] text-center animate-in zoom-in duration-300">
-             <div className="w-16 h-16 bg-emerald-500/20 rounded-full flex items-center justify-center mx-auto mb-6">
-                <i className="fa-solid fa-plug text-emerald-400 text-2xl"></i>
-             </div>
-             <h2 className="text-2xl font-black mb-6 uppercase tracking-tight">Enter Code</h2>
-             <input 
-              type="text" 
-              value={joinId}
-              onChange={(e) => setJoinId(e.target.value.toUpperCase())}
-              placeholder="E.G. ABCDE"
-              className="w-full bg-slate-900 border-2 border-slate-700 focus:border-emerald-500 rounded-2xl py-4 px-6 text-center text-3xl font-black tracking-[0.5em] font-mono mb-4 outline-none transition"
-             />
-             <button 
-              onClick={() => { initMultiplayer('JOIN'); setTimeout(connectToHost, 1000); }} 
-              className="w-full py-5 bg-emerald-600 hover:bg-emerald-500 rounded-2xl font-black text-white shadow-xl shadow-emerald-900/20 transition mb-4 active:scale-95"
-             >
-                CONNECT
-             </button>
-             <button onClick={() => setLobbyMode('MAIN')} className="w-full py-4 bg-slate-700 hover:bg-slate-600 rounded-2xl font-bold transition">BACK</button>
           </div>
         )}
       </div>
     );
   }
 
-  const currentPlayer = gameState.players[gameState.activePlayerIndex];
-  const opponent = gameState.players[1 - gameState.activePlayerIndex];
-  const isMyTurn = (connRef.current) 
-    ? (gameState.multiplayerRole === 'HOST' ? gameState.activePlayerIndex === 0 : gameState.activePlayerIndex === 1)
-    : true;
+  const myIndex = (gameState.multiplayerRole === 'JOINER') ? 1 : 0;
+  const opponentIndex = 1 - myIndex;
+  
+  const me = gameState.players[myIndex];
+  const them = gameState.players[opponentIndex];
+  const isMyTurn = gameState.activePlayerIndex === myIndex;
+  const activePlayer = gameState.players[gameState.activePlayerIndex];
+
+  // Logic to determine if a property set is a valid rent target
+  const isValidRentTarget = (set: PropertySet) => {
+    if (!pendingRentCard) return false;
+    if (pendingRentCard.color === 'ANY') return true;
+    return set.color === pendingRentCard.color || set.color === pendingRentCard.secondaryColor;
+  };
 
   return (
     <div className="h-screen bg-[#020617] flex flex-col overflow-hidden select-none text-slate-200">
@@ -416,7 +450,7 @@ const App: React.FC = () => {
           <div className="flex flex-col">
             <span className="text-[10px] text-slate-500 font-bold uppercase tracking-widest">Turn Of</span>
             <span className={`font-black text-lg ${gameState.activePlayerIndex === 0 ? 'text-blue-400' : 'text-amber-400'}`}>
-              {currentPlayer.name.toUpperCase()} {isMyTurn ? '(YOU)' : ''}
+              {activePlayer.name.toUpperCase()} {isMyTurn ? '(YOU)' : ''}
             </span>
           </div>
           <div className="h-10 w-[1px] bg-white/10" />
@@ -427,61 +461,40 @@ const App: React.FC = () => {
             <span className="text-xs font-bold text-amber-500 ml-1 uppercase">{gameState.actionsRemaining} Actions Left</span>
           </div>
         </div>
-        <div className="flex items-center gap-4">
-          {connRef.current && (
-            <div className="hidden sm:flex items-center gap-2 px-3 py-1 bg-emerald-500/10 border border-emerald-500/20 rounded-full">
-               <div className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse" />
-               <span className="text-[10px] font-bold text-emerald-400 uppercase tracking-tighter">Live Session</span>
-            </div>
-          )}
-          <button onClick={() => setShowLog(!showLog)} className="w-10 h-10 rounded-full bg-slate-800 flex items-center justify-center hover:bg-slate-700 transition">
-            <i className="fa-solid fa-list-ul text-sm"></i>
-          </button>
-          <button onClick={() => { peerRef.current?.destroy(); setGameState(null); setLobbyMode('MAIN'); }} className="px-4 h-10 rounded-full bg-red-500/10 text-red-400 border border-red-500/20 flex items-center gap-2 hover:bg-red-500/20 transition font-bold text-xs uppercase tracking-tighter">
-            <i className="fa-solid fa-arrow-left"></i> Menu
-          </button>
-        </div>
       </div>
 
       <div className="flex-1 flex p-4 gap-4 overflow-hidden relative">
         
-        {/* Left Panel: Opponent Assets */}
-        <div className={`flex-1 flex flex-col rounded-[2.5rem] p-6 transition-all duration-700 overflow-y-auto custom-scrollbar bg-slate-900/40 border border-white/5`}>
+        {/* Left Panel: Opponent Assets (Them) */}
+        <div className={`flex-1 flex flex-col rounded-[2.5rem] p-6 transition-all duration-700 overflow-y-auto custom-scrollbar bg-slate-900/40 border border-white/5 ${!isMyTurn ? 'ring-2 ring-amber-500/30' : ''}`}>
           <div className="flex justify-between items-center mb-6">
             <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-full bg-slate-800 flex items-center justify-center border border-white/10">
-                <i className="fa-solid fa-user-circle text-slate-400"></i>
-              </div>
-              <span className="font-black text-xl tracking-tight opacity-50">{opponent.name}</span>
+              <div className="w-10 h-10 rounded-full bg-slate-800 flex items-center justify-center border border-white/10"><i className="fa-solid fa-user-circle text-slate-400"></i></div>
+              <span className="font-black text-xl tracking-tight uppercase opacity-50">{them.name}</span>
             </div>
-            <div className="flex gap-3">
-               <div className="bg-emerald-500/5 px-3 py-1 rounded-xl border border-emerald-500/10 text-emerald-500/60 font-bold text-sm">
-                 {opponent.bank.reduce((s, c) => s + c.value, 0)}M
-               </div>
-               <div className="bg-amber-500/5 px-3 py-1 rounded-xl border border-amber-500/10 text-amber-500/60 font-bold text-sm">
-                 {opponent.properties.filter(p => p.isComplete).length}/3 SETS
-               </div>
+            <div className="flex gap-4">
+               <div className="bg-emerald-500/10 px-4 py-2 rounded-2xl border-2 border-emerald-500/20 text-emerald-500/70 font-black text-xl shadow-lg">{them.bank.reduce((s, c) => s + c.value, 0)}M</div>
+               <div className="bg-amber-500/5 px-3 py-1 rounded-xl border border-amber-500/10 text-amber-500/60 font-bold text-sm">{them.properties.filter(p => p.isComplete).length}/3 SETS</div>
             </div>
           </div>
-          
           <div className="grid grid-cols-2 lg:grid-cols-3 gap-4 mb-8">
-            {opponent.properties.map((set, i) => (
-              <div key={i} className={`relative p-2 rounded-2xl bg-white/5 border transition-all ${set.isComplete ? 'border-amber-500/50 shadow-[0_0_20px_rgba(245,158,11,0.05)]' : 'border-white/5'}`}>
-                 <div className="flex -space-x-12 hover:space-x-2 transition-all duration-500 overflow-visible h-28 items-center justify-center">
-                    {set.cards.map(c => <CardUI key={c.id} card={c} size="sm" className="shadow-xl" />)}
+            {them.properties.map((set, i) => (
+              <div key={i} className={`relative p-2 rounded-2xl bg-white/5 border transition-all ${set.isComplete ? 'border-amber-400 shadow-[0_0_25px_rgba(251,191,36,0.2)] bg-amber-500/5 scale-[1.02]' : 'border-white/5'}`}>
+                 {set.isComplete && (
+                   <div className="absolute -top-2 -right-2 w-6 h-6 bg-amber-500 rounded-full flex items-center justify-center shadow-lg z-10 animate-bounce">
+                     <i className="fa-solid fa-check text-white text-[10px]"></i>
+                   </div>
+                 )}
+                 <div className="flex -space-x-12 transition-all duration-500 overflow-visible h-28 items-center justify-center">
+                    {set.cards.map(c => <CardUI key={c.id} card={c} size="sm" className="shadow-xl" disabled />)}
                  </div>
+                 {set.isComplete && <div className="text-center text-[8px] font-black text-amber-500 uppercase tracking-widest pb-1">Full Set</div>}
               </div>
-            ))}
-          </div>
-
-          <div className="mt-auto flex gap-1 justify-center opacity-20">
-            {opponent.hand.map((_, i) => (
-              <div key={i} className="w-8 h-12 bg-slate-800 rounded-md border border-slate-700" />
             ))}
           </div>
         </div>
 
-        {/* Center: Deck/Discard */}
+        {/* Center: Deck */}
         <div className="w-24 flex flex-col items-center justify-center gap-8 py-10">
           <div className="relative group cursor-help">
             <div className="w-16 h-24 bg-blue-700 rounded-xl border-2 border-white/20 shadow-2xl transform rotate-3 translate-x-1"></div>
@@ -494,52 +507,75 @@ const App: React.FC = () => {
           </div>
         </div>
 
-        {/* Right Panel: Your Assets */}
-        <div className={`flex-1 flex flex-col rounded-[2.5rem] p-6 transition-all duration-700 overflow-y-auto custom-scrollbar ${isMyTurn ? 'bg-blue-600/5 border border-blue-500/30' : 'bg-slate-900/40 border border-white/5'}`}>
+        {/* Right Panel: Your Assets (Me) */}
+        <div className={`flex-1 flex flex-col rounded-[2.5rem] p-6 transition-all duration-700 overflow-y-auto custom-scrollbar ${isMyTurn ? 'bg-blue-600/5 border border-blue-500/30 ring-2 ring-blue-500/20' : 'bg-slate-900/40 border border-white/5'}`}>
           <div className="flex justify-between items-center mb-6">
             <div className="flex items-center gap-3">
-              <div className={`w-10 h-10 rounded-full flex items-center justify-center border transition-all ${isMyTurn ? 'bg-blue-600 border-blue-400 shadow-[0_0_15px_rgba(37,99,235,0.3)]' : 'bg-slate-800 border-white/10'}`}>
-                <i className={`fa-solid fa-user ${isMyTurn ? 'text-white' : 'text-slate-500'}`}></i>
-              </div>
-              <span className="font-black text-xl tracking-tight uppercase tracking-widest">{isMyTurn ? 'Your Strategy' : 'Opponent Thinking'}</span>
+              <div className={`w-10 h-10 rounded-full flex items-center justify-center border transition-all ${isMyTurn ? 'bg-blue-600 border-blue-400 shadow-[0_0_15px_rgba(37,99,235,0.3)]' : 'bg-slate-800 border-white/10'}`}><i className={`fa-solid fa-user ${isMyTurn ? 'text-white' : 'text-slate-500'}`}></i></div>
+              <span className="font-black text-xl tracking-tight uppercase tracking-widest">
+                {pendingRentCard ? 'Select Rent Target' : isMyTurn ? 'Your Strategy' : 'Opponent Thinking'}
+              </span>
             </div>
-            <div className="flex gap-3">
-               <div className="bg-emerald-500/10 px-3 py-1 rounded-xl border border-emerald-500/20 text-emerald-400 font-bold text-sm">
-                 {currentPlayer.bank.reduce((s, c) => s + c.value, 0)}M
-               </div>
-               <div className="bg-amber-500/10 px-3 py-1 rounded-xl border border-amber-500/20 text-amber-400 font-bold text-sm">
-                 {currentPlayer.properties.filter(p => p.isComplete).length}/3 SETS
-               </div>
+            <div className="flex gap-4">
+               <div className="bg-emerald-500/20 px-4 py-2 rounded-2xl border-2 border-emerald-500/40 text-emerald-400 font-black text-xl shadow-[0_0_20px_rgba(16,185,129,0.1)]">{me.bank.reduce((s, c) => s + c.value, 0)}M</div>
+               <div className="bg-amber-500/10 px-3 py-1 rounded-xl border border-amber-500/20 text-amber-400 font-bold text-sm">{me.properties.filter(p => p.isComplete).length}/3 SETS</div>
             </div>
           </div>
           
           <div className="grid grid-cols-2 lg:grid-cols-3 gap-6 mb-8 flex-1">
-            {currentPlayer.properties.map((set, i) => (
-              <div key={i} className={`relative p-3 rounded-2xl bg-white/5 border transition-all ${set.isComplete ? 'border-amber-500/80 shadow-[0_0_30px_rgba(245,158,11,0.1)]' : 'border-white/10'}`}>
-                 <div className="flex -space-x-12 hover:space-x-2 transition-all duration-500 pb-2 overflow-visible h-32 items-center justify-center">
-                    {set.cards.map(c => <CardUI key={c.id} card={c} size="sm" className="shadow-2xl hover:-translate-y-4" />)}
-                 </div>
-                 <div className="absolute bottom-2 right-3 text-[10px] font-black text-white/10 uppercase tracking-widest">{set.color}</div>
-              </div>
-            ))}
+            {me.properties.map((set, i) => {
+              const isValid = isValidRentTarget(set);
+              return (
+                <div 
+                  key={i} 
+                  onClick={() => isValid && handleRentCollection(i)}
+                  className={`relative p-3 rounded-2xl bg-white/5 border transition-all cursor-pointer
+                    ${set.isComplete ? 'border-amber-400 shadow-[0_0_35px_rgba(251,191,36,0.3)] bg-amber-500/5 scale-[1.02]' : 'border-white/10'}
+                    ${pendingRentCard && !isValid ? 'opacity-20 grayscale' : ''}
+                    ${isValid ? 'ring-4 ring-amber-500 ring-offset-4 ring-offset-[#020617] animate-pulse z-30' : ''}
+                    hover:bg-white/10
+                  `}
+                >
+                  {set.isComplete && (
+                    <div className="absolute -top-3 -right-3 w-8 h-8 bg-amber-500 rounded-full flex items-center justify-center shadow-[0_0_15px_rgba(245,158,11,0.5)] z-10 border-2 border-slate-900">
+                      <i className="fa-solid fa-crown text-white text-xs"></i>
+                    </div>
+                  )}
+                  {isValid && (
+                    <div className="absolute inset-0 bg-amber-500/10 rounded-2xl flex items-center justify-center z-20">
+                      <span className="font-black text-xs text-amber-400 bg-slate-900 px-3 py-1 rounded-full border border-amber-400 uppercase tracking-widest shadow-xl">Collect Here</span>
+                    </div>
+                  )}
+                  <div className="flex -space-x-12 hover:space-x-2 transition-all duration-500 pb-2 overflow-visible h-32 items-center justify-center">
+                      {set.cards.map(c => <CardUI key={c.id} card={c} size="sm" className="shadow-2xl" disabled />)}
+                  </div>
+                  <div className="absolute bottom-2 right-3 text-[10px] font-black text-white/10 uppercase tracking-widest">{set.color}</div>
+                </div>
+              );
+            })}
           </div>
 
-          <div className="mt-4 p-4 bg-slate-900/60 rounded-3xl border border-white/5 min-h-[200px] flex flex-wrap items-center justify-center gap-3">
-             {isMyTurn ? currentPlayer.hand.map(card => (
+          <div className={`mt-4 p-4 rounded-3xl border transition-all duration-500 min-h-[200px] flex flex-wrap items-center justify-center gap-3
+            ${isMyTurn && gameState.actionsRemaining > 0 ? 'bg-slate-900/60 border-white/5' : 'bg-slate-950/80 border-white/10 blur-[1px]'}
+          `}>
+             {isMyTurn ? me.hand.map(card => (
                <CardUI 
-                key={card.id} 
-                card={card} 
-                selected={selectedCardId === card.id}
-                onClick={() => handleCardClick(card.id)}
-                disabled={!isMyTurn || isProcessing}
+                 key={card.id} 
+                 card={card} 
+                 selected={selectedCardId === card.id} 
+                 onClick={() => handleCardClick(card.id)} 
+                 disabled={!isMyTurn || isProcessing || gameState.actionsRemaining <= 0 || !!pendingRentCard} 
                />
              )) : (
                 <div className="flex flex-col items-center gap-4 opacity-40">
-                  <div className="flex gap-2 animate-pulse">
-                    {[1,2,3].map(i => <div key={i} className="w-10 h-16 bg-slate-800 rounded-lg border border-slate-700" />)}
-                  </div>
-                  <span className="text-xs font-black uppercase tracking-[0.4em] text-slate-500 animate-pulse">Waiting for network...</span>
+                  <div className="flex gap-2 animate-pulse">{[1,2,3].map(i => <div key={i} className="w-10 h-16 bg-slate-800 rounded-lg border border-slate-700" />)}</div>
+                  <span className="text-xs font-black uppercase tracking-[0.4em] text-slate-500 animate-pulse">Waiting for opponent...</span>
                 </div>
+             )}
+             {isMyTurn && gameState.actionsRemaining <= 0 && (
+               <div className="absolute inset-0 flex items-center justify-center bg-black/40 rounded-3xl pointer-events-none">
+                 <span className="bg-slate-900 px-6 py-3 border border-white/10 rounded-full font-black text-sm text-slate-400 uppercase tracking-[0.3em]">No Actions Remaining</span>
+               </div>
              )}
           </div>
         </div>
@@ -547,48 +583,33 @@ const App: React.FC = () => {
 
       {/* Footer Controls */}
       <div className="h-28 bg-slate-900 border-t border-white/5 flex items-center justify-center gap-6 px-10 relative">
-        {selectedCardId && isMyTurn ? (
+        {pendingRentCard ? (
+          <div className="animate-in fade-in zoom-in duration-300 flex items-center gap-8">
+            <span className="font-black text-amber-500 text-xl italic uppercase tracking-tighter animate-pulse">Choose a Property Set to Collect Rent</span>
+            <button onClick={() => { me.hand.push(pendingRentCard); setPendingRentCard(null); }} className="px-6 py-2 bg-slate-800 hover:bg-slate-700 rounded-xl font-bold text-xs">CANCEL ACTION</button>
+          </div>
+        ) : selectedCardId && isMyTurn && gameState.actionsRemaining > 0 ? (
           <div className="flex items-center gap-4 animate-in slide-in-from-bottom-8 duration-500">
-            <button 
-              onClick={() => executeMove('BANK', selectedCardId)}
-              className="px-10 py-4 bg-emerald-600 hover:bg-emerald-500 text-white rounded-2xl font-black shadow-xl transition active:scale-95 border-b-4 border-emerald-800 flex items-center gap-3"
-            >
-              <i className="fa-solid fa-piggy-bank"></i> BANK
-            </button>
-            <button 
-              onClick={() => executeMove('PROPERTY', selectedCardId)}
-              disabled={['MONEY'].includes(currentPlayer.hand.find(c => c.id === selectedCardId)?.type || '')}
-              className="px-10 py-4 bg-amber-600 hover:bg-amber-500 disabled:opacity-30 text-white rounded-2xl font-black shadow-xl transition active:scale-95 border-b-4 border-amber-800 flex items-center gap-3"
-            >
-              <i className="fa-solid fa-city"></i> ASSET
-            </button>
-            <button 
-              onClick={() => executeMove('ACTION_PLAY', selectedCardId)}
-              disabled={!['ACTION', 'RENT'].includes(currentPlayer.hand.find(c => c.id === selectedCardId)?.type || '')}
-              className="px-10 py-4 bg-blue-600 hover:bg-blue-500 disabled:opacity-30 text-white rounded-2xl font-black shadow-xl transition active:scale-95 border-b-4 border-blue-800 flex items-center gap-3"
-            >
-              <i className="fa-solid fa-play"></i> PLAY
-            </button>
-            <button 
-              onClick={() => setSelectedCardId(null)}
-              className="w-14 h-14 bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white rounded-2xl transition flex items-center justify-center border border-white/5"
-            >
-              <i className="fa-solid fa-times text-xl"></i>
-            </button>
+            <button onClick={() => executeMove('BANK', selectedCardId)} className="px-10 py-4 bg-emerald-600 hover:bg-emerald-500 text-white rounded-2xl font-black shadow-xl transition active:scale-95 border-b-4 border-emerald-800 flex items-center gap-3"><i className="fa-solid fa-piggy-bank"></i> BANK</button>
+            <button onClick={() => executeMove('PROPERTY', selectedCardId)} disabled={['MONEY'].includes(me.hand.find(c => c.id === selectedCardId)?.type || '')} className="px-10 py-4 bg-amber-600 hover:bg-amber-500 disabled:opacity-30 text-white rounded-2xl font-black shadow-xl transition active:scale-95 border-b-4 border-amber-800 flex items-center gap-3"><i className="fa-solid fa-city"></i> ASSET</button>
+            <button onClick={() => executeMove('ACTION_PLAY', selectedCardId)} disabled={!['ACTION', 'RENT', 'WILD'].includes(me.hand.find(c => c.id === selectedCardId)?.type || '')} className="px-10 py-4 bg-blue-600 hover:bg-blue-500 disabled:opacity-30 text-white rounded-2xl font-black shadow-xl transition active:scale-95 border-b-4 border-blue-800 flex items-center gap-3"><i className="fa-solid fa-play"></i> PLAY</button>
+            <button onClick={() => setSelectedCardId(null)} className="w-14 h-14 bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white rounded-2xl transition flex items-center justify-center border border-white/5"><i className="fa-solid fa-times text-xl"></i></button>
           </div>
         ) : (
           <button 
-            onClick={endTurn}
-            disabled={!isMyTurn || isProcessing || gameState.phase !== 'PLAY_PHASE'}
-            className="group relative px-20 py-5 bg-gradient-to-r from-red-600 to-red-800 hover:from-red-500 hover:to-red-700 disabled:opacity-10 text-white rounded-2xl font-black tracking-[0.4em] shadow-2xl transition-all active:scale-95 border-b-4 border-red-900 overflow-hidden"
+            onClick={endTurn} 
+            disabled={!isMyTurn || isProcessing || gameState.phase !== 'PLAY_PHASE' || !!pendingRentCard} 
+            className={`group relative px-20 py-5 bg-gradient-to-r from-red-600 to-red-800 hover:from-red-500 hover:to-red-700 disabled:opacity-10 text-white rounded-2xl font-black tracking-[0.4em] shadow-2xl transition-all active:scale-95 border-b-4 border-red-900 overflow-hidden
+              ${isMyTurn && gameState.actionsRemaining <= 0 ? 'animate-pulse scale-105 ring-4 ring-red-500/30' : ''}
+            `}
           >
             END TURN
             <div className="absolute inset-0 bg-white/5 opacity-0 group-hover:opacity-100 transition rounded-2xl"></div>
           </button>
         )}
       </div>
-
-      {/* Overlays */}
+      
+      {/* SHOW LOG OVERLAY */}
       {showLog && (
         <div className="fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex items-center justify-end p-6 pointer-events-none">
            <div className="w-full max-w-sm bg-slate-900 border border-white/10 rounded-[2.5rem] shadow-2xl flex flex-col p-8 pointer-events-auto animate-in slide-in-from-right-20 duration-500 h-full max-h-[85vh]">
@@ -598,9 +619,7 @@ const App: React.FC = () => {
              </div>
              <div className="flex-1 overflow-y-auto custom-scrollbar space-y-4 pr-2">
                 {gameState.logs.map((log, i) => (
-                  <div key={i} className="p-4 bg-slate-800/50 rounded-2xl border-l-4 border-amber-500 text-xs font-bold leading-relaxed shadow-sm uppercase tracking-wider">
-                    {log}
-                  </div>
+                  <div key={i} className="p-4 bg-slate-800/50 rounded-2xl border-l-4 border-amber-500 text-xs font-bold leading-relaxed shadow-sm uppercase tracking-wider">{log}</div>
                 ))}
              </div>
            </div>
@@ -608,10 +627,7 @@ const App: React.FC = () => {
       )}
 
       {isProcessing && (
-        <div className="fixed top-24 left-1/2 -translate-x-1/2 px-10 py-4 bg-amber-500 text-slate-950 rounded-full font-black animate-bounce z-[60] shadow-[0_30px_60px_rgba(245,158,11,0.4)] border-4 border-slate-950 flex items-center gap-4 italic uppercase">
-           <div className="w-3 h-3 bg-slate-950 rounded-full animate-ping" />
-           Gemini is calculating...
-        </div>
+        <div className="fixed top-24 left-1/2 -translate-x-1/2 px-10 py-4 bg-amber-500 text-slate-950 rounded-full font-black animate-bounce z-[60] shadow-[0_30px_60px_rgba(245,158,11,0.4)] border-4 border-slate-950 flex items-center gap-4 italic uppercase"><div className="w-3 h-3 bg-slate-950 rounded-full animate-ping" />Gemini is calculating...</div>
       )}
 
       {gameState.winner && (

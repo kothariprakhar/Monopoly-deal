@@ -8,6 +8,7 @@ export interface AIMove {
 }
 
 export const getAIMoves = async (gameState: GameState): Promise<AIMove[]> => {
+  // Create a new GoogleGenAI instance right before the call to ensure up-to-date config
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   const activePlayer = gameState.players[gameState.activePlayerIndex];
   const opponent = gameState.players[1 - gameState.activePlayerIndex];
@@ -47,7 +48,8 @@ export const getAIMoves = async (gameState: GameState): Promise<AIMove[]> => {
 
   try {
     const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview",
+      // Strategy games involve advanced reasoning, so Pro model is preferred.
+      model: "gemini-3-pro-preview",
       contents: prompt,
       config: {
         responseMimeType: "application/json",
@@ -65,7 +67,9 @@ export const getAIMoves = async (gameState: GameState): Promise<AIMove[]> => {
       }
     });
 
-    return JSON.parse(response.text || '[]');
+    // Directly access .text property and trim whitespace as per guidelines
+    const jsonStr = response.text?.trim() || '[]';
+    return JSON.parse(jsonStr);
   } catch (error) {
     console.error("AI Generation Error:", error);
     return [{ action: 'END_TURN' }];

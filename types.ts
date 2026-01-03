@@ -64,7 +64,7 @@ export const COLOR_MAP: Record<PropertyColor, string> = {
   DARK_BLUE: '#00008B',
   RAILROAD: '#000000',
   UTILITY: '#F5F5DC',
-  ANY: 'linear-gradient(to bottom right, #f8fafc, #94a3b8)'
+  ANY: 'linear-gradient(45deg, #ef4444, #f59e0b, #10b981, #3b82f6, #8b5cf6, #ec4899)'
 };
 
 export const SET_LIMITS: Record<PropertyColor, number> = {
@@ -79,4 +79,18 @@ export const SET_LIMITS: Record<PropertyColor, number> = {
   RAILROAD: 4,
   UTILITY: 2,
   ANY: 999
+};
+
+export const RENT_VALUES: Record<PropertyColor, number[]> = {
+  BROWN: [1, 2],
+  LIGHT_BLUE: [1, 2, 3],
+  PINK: [1, 2, 4],
+  ORANGE: [1, 3, 5],
+  RED: [2, 3, 6],
+  YELLOW: [2, 4, 6],
+  GREEN: [2, 4, 7],
+  DARK_BLUE: [3, 8],
+  RAILROAD: [1, 2, 3, 4],
+  UTILITY: [1, 2],
+  ANY: [0] // Special case
 };

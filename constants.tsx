@@ -1,12 +1,13 @@
 
 import { Card, PropertyColor } from './types';
 
-const createCard = (name: string, type: any, value: number, color?: PropertyColor, desc?: string): Card => ({
+const createCard = (name: string, type: any, value: number, color?: PropertyColor, desc?: string, secondaryColor?: PropertyColor): Card => ({
   id: `${name}-${Math.random().toString(36).substr(2, 9)}`,
   name,
   type,
   value,
   color,
+  secondaryColor,
   description: desc
 });
 
@@ -28,6 +29,19 @@ export const INITIAL_DECK: Card[] = [
   ...Array(3).fill(null).map(() => createCard("It's My Birthday", 'ACTION', 2, undefined, 'Collect 2M from all players.')),
   ...Array(10).fill(null).map(() => createCard('Pass Go', 'ACTION', 1, undefined, 'Draw 2 extra cards.')),
 
+  // Rent Cards
+  createCard('Rent (Brown/L.Blue)', 'RENT', 1, 'BROWN', 'Collect rent for Brown or Light Blue sets.', 'LIGHT_BLUE'),
+  createCard('Rent (Brown/L.Blue)', 'RENT', 1, 'BROWN', 'Collect rent for Brown or Light Blue sets.', 'LIGHT_BLUE'),
+  createCard('Rent (Pink/Orange)', 'RENT', 1, 'PINK', 'Collect rent for Pink or Orange sets.', 'ORANGE'),
+  createCard('Rent (Pink/Orange)', 'RENT', 1, 'PINK', 'Collect rent for Pink or Orange sets.', 'ORANGE'),
+  createCard('Rent (Red/Yellow)', 'RENT', 1, 'RED', 'Collect rent for Red or Yellow sets.', 'YELLOW'),
+  createCard('Rent (Red/Yellow)', 'RENT', 1, 'RED', 'Collect rent for Red or Yellow sets.', 'YELLOW'),
+  createCard('Rent (Green/D.Blue)', 'RENT', 1, 'GREEN', 'Collect rent for Green or Dark Blue sets.', 'DARK_BLUE'),
+  createCard('Rent (Green/D.Blue)', 'RENT', 1, 'GREEN', 'Collect rent for Green or Dark Blue sets.', 'DARK_BLUE'),
+  createCard('Rent (Rail/Util)', 'RENT', 1, 'RAILROAD', 'Collect rent for Railroad or Utility sets.', 'UTILITY'),
+  createCard('Rent (Rail/Util)', 'RENT', 1, 'RAILROAD', 'Collect rent for Railroad or Utility sets.', 'UTILITY'),
+  ...Array(3).fill(null).map(() => createCard('Any Rent', 'RENT', 3, 'ANY', 'Collect rent for ANY color set.')),
+
   // Properties
   ...Array(2).fill(null).map(() => createCard('Old Kent Road', 'PROPERTY', 1, 'BROWN')),
   ...Array(3).fill(null).map(() => createCard('The Angel Islington', 'PROPERTY', 1, 'LIGHT_BLUE')),
@@ -40,7 +54,7 @@ export const INITIAL_DECK: Card[] = [
   ...Array(4).fill(null).map(() => createCard('King\'s Cross Station', 'PROPERTY', 2, 'RAILROAD')),
   ...Array(2).fill(null).map(() => createCard('Water Works', 'PROPERTY', 2, 'UTILITY')),
 
-  // Wildcards (Simplified for this version)
-  createCard('Dark Blue/Green Wild', 'WILD', 4, 'DARK_BLUE'),
-  createCard('Light Blue/Brown Wild', 'WILD', 1, 'LIGHT_BLUE'),
+  // Wildcards
+  createCard('Dark Blue/Green Wild', 'WILD', 4, 'DARK_BLUE', 'Use as Dark Blue or Green property.', 'GREEN'),
+  createCard('Light Blue/Brown Wild', 'WILD', 1, 'LIGHT_BLUE', 'Use as Light Blue or Brown property.', 'BROWN'),
 ];
