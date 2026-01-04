@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import Peer, { DataConnection } from 'peerjs';
 import { GameState, Player, Card, GamePhase, SET_LIMITS, PropertySet, RENT_VALUES } from './types';
@@ -112,7 +111,8 @@ const App: React.FC = () => {
       actionsRemaining: 3,
       logs: ['Game started! Master the market.'],
       winner: null,
-      multiplayerRole: isMultiplayer ? (connRef.current?.peer === peerId ? 'HOST' : 'JOINER') : undefined
+      multiplayerRole: isMultiplayer ? (connRef.current?.peer === peerId ? 'HOST' : 'JOINER') : undefined,
+      pendingAction: null
     };
 
     setGameState(newState);
@@ -132,28 +132,44 @@ const App: React.FC = () => {
 
   const processPayment = (fromPlayer: Player, toPlayer: Player, amount: number, log: string[]) => {
     let remaining = amount;
+    
+    // 1. Prioritize paying with the smallest bank cards first
+    fromPlayer.bank.sort((a, b) => a.value - b.value);
+    
     while (remaining > 0 && fromPlayer.bank.length > 0) {
-      const card = fromPlayer.bank.pop()!;
+      const card = fromPlayer.bank.shift()!; // Shift takes the smallest since we sorted asc
       toPlayer.bank.push(card);
       remaining -= card.value;
       log.unshift(`${fromPlayer.name} paid ${card.name} (${card.value}M) from bank.`);
+      if (remaining < 0) {
+        log.unshift(`Note: No change is given in Monopoly Deal!`);
+      }
     }
+    
+    // 2. If debt still remains, pay with properties
     while (remaining > 0 && fromPlayer.properties.length > 0) {
       const setIdx = fromPlayer.properties.findIndex(p => p.cards.length > 0);
       if (setIdx === -1) break;
-      const card = fromPlayer.properties[setIdx].cards.pop()!;
-      if (fromPlayer.properties[setIdx].cards.length === 0) fromPlayer.properties.splice(setIdx, 1);
       
-      let targetSet = toPlayer.properties.find(p => p.color === (card.color || 'ANY'));
+      const card = fromPlayer.properties[setIdx].cards.pop()!;
+      // Breaking a set or cleaning up
+      if (fromPlayer.properties[setIdx].cards.length === 0) {
+        fromPlayer.properties.splice(setIdx, 1);
+      } else {
+        fromPlayer.properties[setIdx].isComplete = false;
+      }
+      
+      let targetColor = card.color || 'ANY';
+      let targetSet = toPlayer.properties.find(p => p.color === targetColor);
       if (!targetSet) {
-        targetSet = { color: (card.color || 'ANY') as any, cards: [], isComplete: false };
+        targetSet = { color: targetColor as any, cards: [], isComplete: false };
         toPlayer.properties.push(targetSet);
       }
       targetSet.cards.push(card);
       targetSet.isComplete = targetSet.cards.length >= SET_LIMITS[targetSet.color];
       
       remaining -= card.value;
-      log.unshift(`${fromPlayer.name} surrendered ${card.name} to settle debt.`);
+      log.unshift(`${fromPlayer.name} surrendered property ${card.name} to settle debt.`);
     }
   };
 
@@ -186,9 +202,96 @@ const App: React.FC = () => {
     setSelectedCardId(null);
   };
 
+  const resolvePendingAction = useCallback((useJSN: boolean) => {
+    setGameState(prev => {
+      if (!prev || !prev.pendingAction) return prev;
+      const newState = JSON.parse(JSON.stringify(prev)) as GameState;
+      const { type, card, attackerIndex } = newState.pendingAction;
+      const attacker = newState.players[attackerIndex];
+      const opponent = newState.players[1 - attackerIndex];
+
+      if (useJSN) {
+        const jsnIndex = opponent.hand.findIndex(c => c.name === 'Just Say No');
+        if (jsnIndex !== -1) {
+          const jsnCard = opponent.hand.splice(jsnIndex, 1)[0];
+          newState.discardPile.push(jsnCard);
+          newState.discardPile.push(card);
+          newState.logs.unshift(`${opponent.name} played JUST SAY NO! Action blocked.`);
+        }
+      } else {
+        if (type === 'FORCE_DEAL') {
+          const myProps = attacker.properties.filter(p => !p.isComplete);
+          const oppProps = opponent.properties.filter(p => !p.isComplete);
+          if (myProps.length > 0 && oppProps.length > 0) {
+            const mySet = myProps[0];
+            const oppSet = oppProps[0];
+            const myCard = mySet.cards.pop()!;
+            const oppCard = oppSet.cards.pop()!;
+            if (mySet.cards.length === 0) attacker.properties = attacker.properties.filter(p => p !== mySet);
+            else mySet.isComplete = false;
+            
+            if (oppSet.cards.length === 0) opponent.properties = opponent.properties.filter(p => p !== oppSet);
+            else oppSet.isComplete = false;
+            
+            [ [attacker, oppCard], [opponent, myCard] ].forEach(([player, c]: any) => {
+              const color = c.color || 'ANY';
+              let target = player.properties.find((p: any) => p.color === color);
+              if (!target) {
+                target = { color: color as any, cards: [], isComplete: false };
+                player.properties.push(target);
+              }
+              target.cards.push(c);
+              target.isComplete = target.cards.length >= SET_LIMITS[target.color];
+            });
+            newState.logs.unshift(`${attacker.name} played Force Deal: Swapped ${myCard.name} for ${oppCard.name}.`);
+          }
+        } else if (type === 'SLY_DEAL') {
+          const stealableSets = opponent.properties.filter(p => !p.isComplete);
+          if (stealableSets.length > 0) {
+            const targetSet = stealableSets[0];
+            const stolen = targetSet.cards.pop()!;
+            if (targetSet.cards.length === 0) opponent.properties = opponent.properties.filter(p => p !== targetSet);
+            else targetSet.isComplete = false;
+            
+            const color = stolen.color || 'ANY';
+            let mySet = attacker.properties.find(p => p.color === color);
+            if (!mySet) {
+              mySet = { color: color as any, cards: [], isComplete: false };
+              attacker.properties.push(mySet);
+            }
+            mySet.cards.push(stolen);
+            mySet.isComplete = mySet.cards.length >= SET_LIMITS[mySet.color];
+            newState.logs.unshift(`${attacker.name} stole ${stolen.name} with Sly Deal.`);
+          }
+        } else if (type === 'DEAL_BREAKER') {
+          const stealableSets = opponent.properties.filter(p => p.isComplete);
+          if (stealableSets.length > 0) {
+            const targetSet = stealableSets[0];
+            opponent.properties = opponent.properties.filter(p => p !== targetSet);
+            attacker.properties.push(targetSet);
+            newState.logs.unshift(`${attacker.name} played Deal Breaker: Stole a complete ${targetSet.color} set!`);
+          }
+        } else if (type === 'DEBT_COLLECTOR') {
+          newState.logs.unshift(`${attacker.name} used Debt Collector: ${opponent.name} owes 5M.`);
+          processPayment(opponent, attacker, 5, newState.logs);
+        } else if (type === 'BIRTHDAY') {
+          newState.logs.unshift(`${attacker.name} used It's My Birthday! ${opponent.name} owes 2M.`);
+          processPayment(opponent, attacker, 2, newState.logs);
+        }
+        newState.discardPile.push(card);
+      }
+
+      newState.actionsRemaining -= 1;
+      newState.pendingAction = null;
+      checkWinCondition(newState);
+      if (connRef.current) syncState(newState);
+      return newState;
+    });
+  }, []);
+
   const executeMove = useCallback((type: 'BANK' | 'PROPERTY' | 'ACTION_PLAY', cardId: string) => {
     setGameState(prev => {
-      if (!prev || prev.actionsRemaining <= 0 || prev.phase !== 'PLAY_PHASE' || prev.winner) return prev;
+      if (!prev || prev.actionsRemaining <= 0 || prev.phase !== 'PLAY_PHASE' || prev.winner || prev.pendingAction) return prev;
       
       const newState = JSON.parse(JSON.stringify(prev)) as GameState;
       const player = newState.players[newState.activePlayerIndex];
@@ -221,76 +324,37 @@ const App: React.FC = () => {
           break;
         case 'ACTION_PLAY':
           if (card.type === 'RENT') {
-            // Rent cards now go into target selection mode
             player.hand.splice(cardIndex, 1);
             setPendingRentCard(card);
-            return newState; // Decrement action ONLY after target chosen
+            return newState;
           }
           
+          if (['Force Deal', 'Sly Deal', 'Deal Breaker', 'Debt Collector', "It's My Birthday"].includes(card.name)) {
+            player.hand.splice(cardIndex, 1);
+            let actionType: any = card.name.toUpperCase().replace(' ', '_');
+            if (card.name === "It's My Birthday") actionType = 'BIRTHDAY';
+            
+            newState.pendingAction = {
+              type: actionType,
+              card,
+              attackerIndex: newState.activePlayerIndex
+            };
+            
+            if (opponent.hand.some(c => c.name === 'Just Say No')) {
+               if (connRef.current) syncState(newState);
+               return newState;
+            } else {
+               if (connRef.current) syncState(newState);
+               setTimeout(() => resolvePendingAction(false), 500); 
+               return newState;
+            }
+          }
+
           player.hand.splice(cardIndex, 1);
           if (card.name === 'Pass Go') {
             const drawn = newState.deck.splice(0, 2);
             player.hand.push(...drawn);
             newState.logs.unshift(`${player.name} played Pass Go: +2 cards.`);
-          } else if (card.name === 'Debt Collector') {
-            processPayment(opponent, player, 5, newState.logs);
-          } else if (card.name === "It's My Birthday") {
-            processPayment(opponent, player, 2, newState.logs);
-          } else if (card.name === 'Deal Breaker') {
-            const stealableSets = opponent.properties.filter(p => p.isComplete);
-            if (stealableSets.length > 0) {
-              const targetSet = stealableSets[0];
-              opponent.properties = opponent.properties.filter(p => p !== targetSet);
-              player.properties.push(targetSet);
-              newState.logs.unshift(`${player.name} played Deal Breaker: Stole a complete ${targetSet.color} set!`);
-            } else {
-              newState.logs.unshift(`${player.name} played Deal Breaker but opponent has no full sets.`);
-            }
-          } else if (card.name === 'Force Deal') {
-            const myProps = player.properties.filter(p => !p.isComplete);
-            const oppProps = opponent.properties.filter(p => !p.isComplete);
-            if (myProps.length > 0 && oppProps.length > 0) {
-              const mySet = myProps[0];
-              const oppSet = oppProps[0];
-              const myCard = mySet.cards.pop()!;
-              const oppCard = oppSet.cards.pop()!;
-              
-              if (mySet.cards.length === 0) player.properties = player.properties.filter(p => p !== mySet);
-              if (oppSet.cards.length === 0) opponent.properties = opponent.properties.filter(p => p !== oppSet);
-
-              let myTarget = player.properties.find(p => p.color === (oppCard.color || 'ANY'));
-              if (!myTarget) {
-                myTarget = { color: (oppCard.color || 'ANY') as any, cards: [], isComplete: false };
-                player.properties.push(myTarget);
-              }
-              myTarget.cards.push(oppCard);
-              myTarget.isComplete = myTarget.cards.length >= SET_LIMITS[myTarget.color];
-
-              let oppTarget = opponent.properties.find(p => p.color === (myCard.color || 'ANY'));
-              if (!oppTarget) {
-                oppTarget = { color: (myCard.color || 'ANY') as any, cards: [], isComplete: false };
-                opponent.properties.push(oppTarget);
-              }
-              oppTarget.cards.push(myCard);
-              oppTarget.isComplete = oppTarget.cards.length >= SET_LIMITS[oppTarget.color];
-
-              newState.logs.unshift(`${player.name} played Force Deal: Swapped ${myCard.name} for ${oppCard.name}.`);
-            }
-          } else if (card.name === 'Sly Deal') {
-            const stealableSets = opponent.properties.filter(p => !p.isComplete);
-            if (stealableSets.length > 0) {
-              const targetSet = stealableSets[0];
-              const stolen = targetSet.cards.pop()!;
-              if (targetSet.cards.length === 0) opponent.properties = opponent.properties.filter(p => p !== targetSet);
-              let mySet = player.properties.find(p => p.color === (stolen.color || 'ANY'));
-              if (!mySet) {
-                mySet = { color: (stolen.color || 'ANY') as any, cards: [], isComplete: false };
-                player.properties.push(mySet);
-              }
-              mySet.cards.push(stolen);
-              mySet.isComplete = mySet.cards.length >= SET_LIMITS[mySet.color];
-              newState.logs.unshift(`${player.name} stole ${stolen.name} with Sly Deal.`);
-            }
           } else {
             newState.logs.unshift(`${player.name} played ${card.name}.`);
           }
@@ -304,7 +368,7 @@ const App: React.FC = () => {
       return newState;
     });
     setSelectedCardId(null);
-  }, []);
+  }, [resolvePendingAction]);
 
   const startTurn = useCallback(() => {
     setGameState(prev => {
@@ -341,9 +405,9 @@ const App: React.FC = () => {
   }, []);
 
   const handleCardClick = useCallback((cardId: string) => {
-    if (gameState?.winner || pendingRentCard) return;
+    if (gameState?.winner || pendingRentCard || gameState?.pendingAction) return;
     setSelectedCardId(prev => (prev === cardId ? null : cardId));
-  }, [gameState?.winner, pendingRentCard]);
+  }, [gameState?.winner, pendingRentCard, gameState?.pendingAction]);
 
   useEffect(() => {
     if (gameState?.phase === 'START_TURN') {
@@ -358,7 +422,8 @@ const App: React.FC = () => {
       gameState.players[gameState.activePlayerIndex].isAI && 
       gameState.phase === 'PLAY_PHASE' && 
       !aiProcessingRef.current &&
-      !gameState.winner
+      !gameState.winner &&
+      !gameState.pendingAction
     ) {
       const runAI = async () => {
         aiProcessingRef.current = true;
@@ -367,7 +432,7 @@ const App: React.FC = () => {
           const moves = await getAIMoves(gameState);
           for (const move of moves) {
             const current = await new Promise<GameState>(r => setGameState(s => { r(s!); return s; }));
-            if (current.actionsRemaining <= 0 || current.winner) break;
+            if (current.actionsRemaining <= 0 || current.winner || current.pendingAction) break;
             if (move.action === 'END_TURN') break;
             if (move.cardId) {
               const canPlay = current.players[current.activePlayerIndex].hand.some(c => c.id === move.cardId);
@@ -386,7 +451,7 @@ const App: React.FC = () => {
       };
       runAI();
     }
-  }, [gameState?.activePlayerIndex, gameState?.phase, executeMove, endTurn, gameState?.winner]);
+  }, [gameState?.activePlayerIndex, gameState?.phase, executeMove, endTurn, gameState?.winner, gameState?.pendingAction]);
 
   if (!gameState) {
     return (
@@ -434,12 +499,16 @@ const App: React.FC = () => {
   const isMyTurn = gameState.activePlayerIndex === myIndex;
   const activePlayer = gameState.players[gameState.activePlayerIndex];
 
-  // Logic to determine if a property set is a valid rent target
   const isValidRentTarget = (set: PropertySet) => {
     if (!pendingRentCard) return false;
     if (pendingRentCard.color === 'ANY') return true;
     return set.color === pendingRentCard.color || set.color === pendingRentCard.secondaryColor;
   };
+
+  const showJSNPrompt = gameState.pendingAction && 
+    (gameState.multiplayerRole 
+      ? (gameState.multiplayerRole === 'HOST' ? gameState.pendingAction.attackerIndex === 1 : gameState.pendingAction.attackerIndex === 0)
+      : true);
 
   return (
     <div className="h-screen bg-[#020617] flex flex-col overflow-hidden select-none text-slate-200">
@@ -502,7 +571,7 @@ const App: React.FC = () => {
               <span className="font-black text-xl text-white">{gameState.deck.length}</span>
             </div>
           </div>
-          <div className="w-16 h-24 rounded-xl border-2 border-dashed border-white/5 flex items-center justify-center p-2 text-center text-[10px] font-black text-white/10 uppercase tracking-tighter italic">
+          <div className="w-16 h-24 rounded-xl border-2 border-dashed border-white/5 flex items-center justify-center p-2 text-center text-[10px] font-black text-white/10 uppercase tracking-tighter italic text-clip overflow-hidden">
             {gameState.discardPile.length > 0 ? gameState.discardPile[gameState.discardPile.length - 1].name : 'Discard'}
           </div>
         </div>
@@ -564,7 +633,7 @@ const App: React.FC = () => {
                  card={card} 
                  selected={selectedCardId === card.id} 
                  onClick={() => handleCardClick(card.id)} 
-                 disabled={!isMyTurn || isProcessing || gameState.actionsRemaining <= 0 || !!pendingRentCard} 
+                 disabled={!isMyTurn || isProcessing || gameState.actionsRemaining <= 0 || !!pendingRentCard || !!gameState.pendingAction} 
                />
              )) : (
                 <div className="flex flex-col items-center gap-4 opacity-40">
@@ -572,14 +641,29 @@ const App: React.FC = () => {
                   <span className="text-xs font-black uppercase tracking-[0.4em] text-slate-500 animate-pulse">Waiting for opponent...</span>
                 </div>
              )}
-             {isMyTurn && gameState.actionsRemaining <= 0 && (
-               <div className="absolute inset-0 flex items-center justify-center bg-black/40 rounded-3xl pointer-events-none">
-                 <span className="bg-slate-900 px-6 py-3 border border-white/10 rounded-full font-black text-sm text-slate-400 uppercase tracking-[0.3em]">No Actions Remaining</span>
-               </div>
-             )}
           </div>
         </div>
       </div>
+
+      {/* JSN Modal */}
+      {showJSNPrompt && (
+        <div className="fixed inset-0 z-[100] bg-black/80 backdrop-blur-md flex items-center justify-center p-6 animate-in fade-in duration-300">
+           <div className="max-w-md w-full bg-slate-900 border-2 border-amber-500 rounded-[3rem] p-12 text-center shadow-2xl relative overflow-hidden">
+             <div className="absolute top-0 left-0 w-full h-1 bg-amber-500 animate-pulse" />
+             <div className="w-20 h-20 bg-amber-500/20 rounded-full flex items-center justify-center mx-auto mb-6 border-2 border-amber-500">
+                <i className="fa-solid fa-hand-paper text-amber-500 text-3xl"></i>
+             </div>
+             <h3 className="text-2xl font-black text-white mb-2 uppercase tracking-tighter italic">{gameState.players[gameState.pendingAction!.attackerIndex].name} is playing {gameState.pendingAction!.card.name}!</h3>
+             <p className="text-slate-400 font-bold mb-8 uppercase text-xs tracking-widest leading-relaxed">Do you want to use a "Just Say No" card to block this move?</p>
+             <div className="flex flex-col gap-3">
+               {me.hand.some(c => c.name === 'Just Say No') && (
+                 <button onClick={() => resolvePendingAction(true)} className="w-full py-4 bg-amber-500 text-slate-950 font-black rounded-2xl hover:scale-105 transition active:scale-95 shadow-xl uppercase tracking-widest">USE JUST SAY NO</button>
+               )}
+               <button onClick={() => resolvePendingAction(false)} className="w-full py-3 text-slate-500 font-black rounded-2xl border border-white/10 hover:bg-white/5 transition uppercase tracking-widest text-xs">LET IT HAPPEN</button>
+             </div>
+           </div>
+        </div>
+      )}
 
       {/* Footer Controls */}
       <div className="h-28 bg-slate-900 border-t border-white/5 flex items-center justify-center gap-6 px-10 relative">
@@ -598,7 +682,7 @@ const App: React.FC = () => {
         ) : (
           <button 
             onClick={endTurn} 
-            disabled={!isMyTurn || isProcessing || gameState.phase !== 'PLAY_PHASE' || !!pendingRentCard} 
+            disabled={!isMyTurn || isProcessing || gameState.phase !== 'PLAY_PHASE' || !!pendingRentCard || !!gameState.pendingAction} 
             className={`group relative px-20 py-5 bg-gradient-to-r from-red-600 to-red-800 hover:from-red-500 hover:to-red-700 disabled:opacity-10 text-white rounded-2xl font-black tracking-[0.4em] shadow-2xl transition-all active:scale-95 border-b-4 border-red-900 overflow-hidden
               ${isMyTurn && gameState.actionsRemaining <= 0 ? 'animate-pulse scale-105 ring-4 ring-red-500/30' : ''}
             `}
@@ -612,7 +696,7 @@ const App: React.FC = () => {
       {/* SHOW LOG OVERLAY */}
       {showLog && (
         <div className="fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex items-center justify-end p-6 pointer-events-none">
-           <div className="w-full max-w-sm bg-slate-900 border border-white/10 rounded-[2.5rem] shadow-2xl flex flex-col p-8 pointer-events-auto animate-in slide-in-from-right-20 duration-500 h-full max-h-[85vh]">
+           <div className="w-full max-sm:max-w-none max-w-sm bg-slate-900 border border-white/10 rounded-[2.5rem] shadow-2xl flex flex-col p-8 pointer-events-auto animate-in slide-in-from-right-20 duration-500 h-full max-h-[85vh]">
              <div className="flex justify-between items-center mb-8 border-b border-white/5 pb-6">
                <span className="font-black text-2xl tracking-tight text-amber-500">HISTORY</span>
                <button onClick={() => setShowLog(false)} className="w-10 h-10 rounded-full hover:bg-white/5 flex items-center justify-center transition"><i className="fa-solid fa-times"></i></button>

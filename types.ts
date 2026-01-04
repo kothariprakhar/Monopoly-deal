@@ -1,4 +1,3 @@
-
 export type PropertyColor = 
   | 'BROWN' 
   | 'LIGHT_BLUE' 
@@ -41,6 +40,13 @@ export interface PropertySet {
 
 export type GamePhase = 'LOBBY' | 'START_TURN' | 'PLAY_PHASE' | 'END_TURN' | 'GAME_OVER';
 
+export interface PendingAction {
+  type: 'FORCE_DEAL' | 'SLY_DEAL' | 'DEAL_BREAKER' | 'RENT_ALL' | 'DEBT_COLLECTOR' | 'BIRTHDAY';
+  card: Card;
+  attackerIndex: number;
+  targetIndex?: number; // For single target actions
+}
+
 export interface GameState {
   players: Player[];
   activePlayerIndex: number;
@@ -51,6 +57,7 @@ export interface GameState {
   logs: string[];
   winner: string | null;
   multiplayerRole?: 'HOST' | 'JOINER';
+  pendingAction: PendingAction | null;
 }
 
 export const COLOR_MAP: Record<PropertyColor, string> = {
