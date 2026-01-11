@@ -15,12 +15,20 @@ const App: React.FC = () => {
   const [joinId, setJoinId] = useState<string>('');
   const [multiStatus, setMultiStatus] = useState<string>('');
   
-  // Rent targeting state
+  // Interaction states
   const [pendingRentCard, setPendingRentCard] = useState<Card | null>(null);
+  const [pendingForceDeal, setPendingForceDeal] = useState<{ card: Card, mySetIndex?: number } | null>(null);
+  const [pendingSlyDeal, setPendingSlyDeal] = useState<{ card: Card } | null>(null);
 
   const peerRef = useRef<Peer | null>(null);
   const connRef = useRef<DataConnection | null>(null);
   const aiProcessingRef = useRef(false);
+  const gameStateRef = useRef<GameState | null>(null);
+
+  // Keep ref in sync with state for async access
+  useEffect(() => {
+    gameStateRef.current = gameState;
+  }, [gameState]);
 
   // --- Multiplayer Logic ---
 
@@ -207,63 +215,109 @@ const App: React.FC = () => {
       if (!prev || !prev.pendingAction) return prev;
       const newState = JSON.parse(JSON.stringify(prev)) as GameState;
       const { type, card, attackerIndex } = newState.pendingAction;
+      const currentJsnStack = newState.pendingAction.jsnStack || 0;
+      
+      // Determine who is playing JSN (if useJSN is true)
+      // Even stack (0, 2) -> Defender turn to JSN
+      // Odd stack (1, 3) -> Attacker turn to JSN (counter)
+      const isDefenderTurn = currentJsnStack % 2 === 0;
+      const playerIndex = isDefenderTurn ? (1 - attackerIndex) : attackerIndex;
+      const player = newState.players[playerIndex];
+
+      if (useJSN) {
+        const jsnIndex = player.hand.findIndex(c => c.name === 'Just Say No');
+        if (jsnIndex !== -1) {
+          const jsnCard = player.hand.splice(jsnIndex, 1)[0];
+          newState.discardPile.push(jsnCard);
+          
+          // Increment stack
+          newState.pendingAction.jsnStack = currentJsnStack + 1;
+          newState.logs.unshift(`${player.name} used JUST SAY NO! (Chain: ${currentJsnStack + 1})`);
+          
+          if (connRef.current) syncState(newState);
+          return newState; // Return early, waiting for next JSN response
+        }
+      } 
+      
+      // If user declined JSN (or didn't have one), check if action is blocked
+      // Blocked if stack is ODD (1, 3, 5...)
+      const actionBlocked = currentJsnStack % 2 === 1;
+
+      if (actionBlocked) {
+          newState.logs.unshift(`Action ${card.name} blocked by Just Say No.`);
+          newState.discardPile.push(card);
+          newState.pendingAction = null;
+          newState.actionsRemaining -= 1; // Action card still consumes action
+          if (connRef.current) syncState(newState);
+          return newState;
+      }
+
+      // If we are here, action executes (Stack is 0 or Even)
       const attacker = newState.players[attackerIndex];
       const opponent = newState.players[1 - attackerIndex];
 
-      if (useJSN) {
-        const jsnIndex = opponent.hand.findIndex(c => c.name === 'Just Say No');
-        if (jsnIndex !== -1) {
-          const jsnCard = opponent.hand.splice(jsnIndex, 1)[0];
-          newState.discardPile.push(jsnCard);
-          newState.discardPile.push(card);
-          newState.logs.unshift(`${opponent.name} played JUST SAY NO! Action blocked.`);
-        }
-      } else {
-        if (type === 'FORCE_DEAL') {
-          const myProps = attacker.properties.filter(p => !p.isComplete);
-          const oppProps = opponent.properties.filter(p => !p.isComplete);
-          if (myProps.length > 0 && oppProps.length > 0) {
-            const mySet = myProps[0];
-            const oppSet = oppProps[0];
-            const myCard = mySet.cards.pop()!;
-            const oppCard = oppSet.cards.pop()!;
-            if (mySet.cards.length === 0) attacker.properties = attacker.properties.filter(p => p !== mySet);
-            else mySet.isComplete = false;
-            
-            if (oppSet.cards.length === 0) opponent.properties = opponent.properties.filter(p => p !== oppSet);
-            else oppSet.isComplete = false;
-            
-            [ [attacker, oppCard], [opponent, myCard] ].forEach(([player, c]: any) => {
-              const color = c.color || 'ANY';
-              let target = player.properties.find((p: any) => p.color === color);
-              if (!target) {
-                target = { color: color as any, cards: [], isComplete: false };
-                player.properties.push(target);
-              }
-              target.cards.push(c);
-              target.isComplete = target.cards.length >= SET_LIMITS[target.color];
-            });
-            newState.logs.unshift(`${attacker.name} played Force Deal: Swapped ${myCard.name} for ${oppCard.name}.`);
+      if (type === 'FORCE_DEAL') {
+          if (newState.pendingAction.mySetIndex !== undefined && newState.pendingAction.targetSetIndex !== undefined) {
+             const mySet = attacker.properties[newState.pendingAction.mySetIndex];
+             const oppSet = opponent.properties[newState.pendingAction.targetSetIndex];
+             
+             if (mySet && oppSet && mySet.cards.length > 0 && oppSet.cards.length > 0) {
+                const myCard = mySet.cards.pop()!;
+                const oppCard = oppSet.cards.pop()!;
+                
+                if (mySet.cards.length === 0) attacker.properties.splice(newState.pendingAction.mySetIndex, 1);
+                else mySet.isComplete = false;
+                
+                // Note: opponent index might shift if attacker removed set (different arrays so safeish, but be careful with indices if same array, here different players)
+                if (oppSet.cards.length === 0) opponent.properties.splice(newState.pendingAction.targetSetIndex, 1);
+                else oppSet.isComplete = false;
+
+                // Smart placement logic
+                const placeCard = (p: Player, c: Card) => {
+                   let targetColor = c.color || 'ANY';
+                   let target = p.properties.find(set => set.color === targetColor && !set.isComplete);
+                   if (!target && c.secondaryColor) target = p.properties.find(set => set.color === c.secondaryColor && !set.isComplete);
+                   if (!target) target = p.properties.find(set => set.color === targetColor); // Fallback to complete
+                   if (!target) {
+                     target = { color: targetColor as any, cards: [], isComplete: false };
+                     p.properties.push(target);
+                   }
+                   target.cards.push(c);
+                   target.isComplete = target.cards.length >= SET_LIMITS[target.color];
+                };
+
+                placeCard(attacker, oppCard);
+                placeCard(opponent, myCard);
+                newState.logs.unshift(`${attacker.name} played Force Deal: Swapped ${myCard.name} for ${oppCard.name}.`);
+             }
           }
-        } else if (type === 'SLY_DEAL') {
-          const stealableSets = opponent.properties.filter(p => !p.isComplete);
-          if (stealableSets.length > 0) {
-            const targetSet = stealableSets[0];
-            const stolen = targetSet.cards.pop()!;
-            if (targetSet.cards.length === 0) opponent.properties = opponent.properties.filter(p => p !== targetSet);
-            else targetSet.isComplete = false;
-            
-            const color = stolen.color || 'ANY';
-            let mySet = attacker.properties.find(p => p.color === color);
-            if (!mySet) {
-              mySet = { color: color as any, cards: [], isComplete: false };
-              attacker.properties.push(mySet);
-            }
-            mySet.cards.push(stolen);
-            mySet.isComplete = mySet.cards.length >= SET_LIMITS[mySet.color];
-            newState.logs.unshift(`${attacker.name} stole ${stolen.name} with Sly Deal.`);
+      } else if (type === 'SLY_DEAL') {
+          // Logic for Sly Deal with specific target set
+          if (newState.pendingAction.targetSetIndex !== undefined) {
+             const targetSet = opponent.properties[newState.pendingAction.targetSetIndex];
+             // Sly deal cannot steal from complete sets (validated in UI/AI choice, but check again)
+             if (targetSet && !targetSet.isComplete && targetSet.cards.length > 0) {
+                 const stolen = targetSet.cards.pop()!;
+                 if (targetSet.cards.length === 0) opponent.properties.splice(newState.pendingAction.targetSetIndex, 1);
+                 else targetSet.isComplete = false;
+
+                 // Give to attacker
+                 let targetColor = stolen.color || 'ANY';
+                 let mySet = attacker.properties.find(p => p.color === targetColor && !p.isComplete);
+                 if (!mySet && stolen.secondaryColor) mySet = attacker.properties.find(p => p.color === stolen.secondaryColor && !p.isComplete);
+                 if (!mySet) {
+                    mySet = { color: targetColor as any, cards: [], isComplete: false };
+                    attacker.properties.push(mySet);
+                 }
+                 mySet.cards.push(stolen);
+                 mySet.isComplete = mySet.cards.length >= SET_LIMITS[mySet.color];
+                 newState.logs.unshift(`${attacker.name} stole ${stolen.name} with Sly Deal.`);
+             } else {
+                newState.logs.unshift(`${attacker.name} tried Sly Deal but target was invalid.`);
+             }
           }
-        } else if (type === 'DEAL_BREAKER') {
+      } else if (type === 'DEAL_BREAKER') {
+          // Auto-select first complete set for now (could be targeted too)
           const stealableSets = opponent.properties.filter(p => p.isComplete);
           if (stealableSets.length > 0) {
             const targetSet = stealableSets[0];
@@ -271,16 +325,15 @@ const App: React.FC = () => {
             attacker.properties.push(targetSet);
             newState.logs.unshift(`${attacker.name} played Deal Breaker: Stole a complete ${targetSet.color} set!`);
           }
-        } else if (type === 'DEBT_COLLECTOR') {
+      } else if (type === 'DEBT_COLLECTOR') {
           newState.logs.unshift(`${attacker.name} used Debt Collector: ${opponent.name} owes 5M.`);
           processPayment(opponent, attacker, 5, newState.logs);
-        } else if (type === 'BIRTHDAY') {
+      } else if (type === 'BIRTHDAY') {
           newState.logs.unshift(`${attacker.name} used It's My Birthday! ${opponent.name} owes 2M.`);
           processPayment(opponent, attacker, 2, newState.logs);
-        }
-        newState.discardPile.push(card);
       }
-
+      
+      newState.discardPile.push(card);
       newState.actionsRemaining -= 1;
       newState.pendingAction = null;
       checkWinCondition(newState);
@@ -288,6 +341,45 @@ const App: React.FC = () => {
       return newState;
     });
   }, []);
+
+  const initiateForceDeal = (targetSetIndex: number) => {
+    setGameState(prev => {
+       if (!prev || !pendingForceDeal || pendingForceDeal.mySetIndex === undefined) return prev;
+       const newState = JSON.parse(JSON.stringify(prev)) as GameState;
+       
+       newState.pendingAction = {
+         type: 'FORCE_DEAL',
+         card: pendingForceDeal.card,
+         attackerIndex: newState.activePlayerIndex,
+         mySetIndex: pendingForceDeal.mySetIndex,
+         targetSetIndex: targetSetIndex,
+         jsnStack: 0
+       };
+
+       if (connRef.current) syncState(newState);
+       return newState;
+    });
+    setPendingForceDeal(null);
+  };
+
+  const initiateSlyDeal = (targetSetIndex: number) => {
+    setGameState(prev => {
+       if (!prev || !pendingSlyDeal) return prev;
+       const newState = JSON.parse(JSON.stringify(prev)) as GameState;
+       
+       newState.pendingAction = {
+         type: 'SLY_DEAL',
+         card: pendingSlyDeal.card,
+         attackerIndex: newState.activePlayerIndex,
+         targetSetIndex: targetSetIndex,
+         jsnStack: 0
+       };
+
+       if (connRef.current) syncState(newState);
+       return newState;
+    });
+    setPendingSlyDeal(null);
+  };
 
   const executeMove = useCallback((type: 'BANK' | 'PROPERTY' | 'ACTION_PLAY', cardId: string) => {
     setGameState(prev => {
@@ -328,8 +420,66 @@ const App: React.FC = () => {
             setPendingRentCard(card);
             return newState;
           }
+
+          if (card.name === 'Force Deal') {
+            player.hand.splice(cardIndex, 1);
+            
+            // AI Auto-Target for Force Deal
+            if (player.isAI) {
+               // Pick random non-complete set from me
+               const myIndices = player.properties.map((p, i) => ({p, i})).filter(x => !x.p.isComplete && x.p.cards.length > 0);
+               // Pick random non-complete set from opp
+               const oppIndices = opponent.properties.map((p, i) => ({p, i})).filter(x => !x.p.isComplete && x.p.cards.length > 0);
+               
+               if (myIndices.length > 0 && oppIndices.length > 0) {
+                 const myIdx = myIndices[Math.floor(Math.random() * myIndices.length)].i;
+                 const oppIdx = oppIndices[Math.floor(Math.random() * oppIndices.length)].i;
+                 newState.pendingAction = {
+                    type: 'FORCE_DEAL',
+                    card,
+                    attackerIndex: newState.activePlayerIndex,
+                    mySetIndex: myIdx,
+                    targetSetIndex: oppIdx,
+                    jsnStack: 0
+                 };
+               } else {
+                 newState.logs.unshift("AI tried Force Deal but had no valid targets. Card wasted.");
+                 newState.discardPile.push(card);
+                 newState.actionsRemaining -= 1;
+               }
+            } else {
+               setPendingForceDeal({ card });
+            }
+            return newState;
+          }
+
+          if (card.name === 'Sly Deal') {
+            player.hand.splice(cardIndex, 1);
+
+            // AI Auto-Target for Sly Deal
+            if (player.isAI) {
+               const oppIndices = opponent.properties.map((p, i) => ({p, i})).filter(x => !x.p.isComplete && x.p.cards.length > 0);
+               if (oppIndices.length > 0) {
+                  const oppIdx = oppIndices[Math.floor(Math.random() * oppIndices.length)].i;
+                  newState.pendingAction = {
+                     type: 'SLY_DEAL',
+                     card,
+                     attackerIndex: newState.activePlayerIndex,
+                     targetSetIndex: oppIdx,
+                     jsnStack: 0
+                  };
+               } else {
+                  newState.logs.unshift("AI tried Sly Deal but nothing to steal. Card wasted.");
+                  newState.discardPile.push(card);
+                  newState.actionsRemaining -= 1;
+               }
+            } else {
+               setPendingSlyDeal({ card });
+            }
+            return newState;
+          }
           
-          if (['Force Deal', 'Sly Deal', 'Deal Breaker', 'Debt Collector', "It's My Birthday"].includes(card.name)) {
+          if (['Deal Breaker', 'Debt Collector', "It's My Birthday"].includes(card.name)) {
             player.hand.splice(cardIndex, 1);
             let actionType: any = card.name.toUpperCase().replace(' ', '_');
             if (card.name === "It's My Birthday") actionType = 'BIRTHDAY';
@@ -337,29 +487,22 @@ const App: React.FC = () => {
             newState.pendingAction = {
               type: actionType,
               card,
-              attackerIndex: newState.activePlayerIndex
+              attackerIndex: newState.activePlayerIndex,
+              jsnStack: 0
             };
-            
-            if (opponent.hand.some(c => c.name === 'Just Say No')) {
-               if (connRef.current) syncState(newState);
-               return newState;
-            } else {
-               if (connRef.current) syncState(newState);
-               setTimeout(() => resolvePendingAction(false), 500); 
-               return newState;
-            }
-          }
-
-          player.hand.splice(cardIndex, 1);
-          if (card.name === 'Pass Go') {
-            const drawn = newState.deck.splice(0, 2);
-            player.hand.push(...drawn);
-            newState.logs.unshift(`${player.name} played Pass Go: +2 cards.`);
           } else {
-            newState.logs.unshift(`${player.name} played ${card.name}.`);
+            // General actions like Pass Go
+            player.hand.splice(cardIndex, 1);
+            if (card.name === 'Pass Go') {
+               const drawn = newState.deck.splice(0, 2);
+               player.hand.push(...drawn);
+               newState.logs.unshift(`${player.name} played Pass Go: +2 cards.`);
+            } else {
+               newState.logs.unshift(`${player.name} played ${card.name}.`);
+            }
+            newState.discardPile.push(card);
+            newState.actionsRemaining -= 1;
           }
-          newState.discardPile.push(card);
-          newState.actionsRemaining -= 1;
           break;
       }
 
@@ -390,7 +533,7 @@ const App: React.FC = () => {
     setGameState(prev => {
       if (!prev || prev.phase !== 'PLAY_PHASE') return prev;
       const nextIdx = (prev.activePlayerIndex + 1) % 2;
-      const newState = {
+      const newState: GameState = {
         ...prev,
         activePlayerIndex: nextIdx,
         actionsRemaining: 3,
@@ -402,12 +545,14 @@ const App: React.FC = () => {
     });
     setSelectedCardId(null);
     setPendingRentCard(null);
+    setPendingForceDeal(null);
+    setPendingSlyDeal(null);
   }, []);
 
   const handleCardClick = useCallback((cardId: string) => {
-    if (gameState?.winner || pendingRentCard || gameState?.pendingAction) return;
+    if (gameState?.winner || pendingRentCard || gameState?.pendingAction || pendingForceDeal || pendingSlyDeal) return;
     setSelectedCardId(prev => (prev === cardId ? null : cardId));
-  }, [gameState?.winner, pendingRentCard, gameState?.pendingAction]);
+  }, [gameState?.winner, pendingRentCard, gameState?.pendingAction, pendingForceDeal, pendingSlyDeal]);
 
   useEffect(() => {
     if (gameState?.phase === 'START_TURN') {
@@ -416,6 +561,7 @@ const App: React.FC = () => {
     }
   }, [gameState?.phase, startTurn]);
 
+  // AI Logic Loop
   useEffect(() => {
     if (
       gameState && 
@@ -431,9 +577,11 @@ const App: React.FC = () => {
         try {
           const moves = await getAIMoves(gameState);
           for (const move of moves) {
-            const current = await new Promise<GameState>(r => setGameState(s => { r(s!); return s; }));
+            const current = gameStateRef.current;
+            if (!current) break; 
             if (current.actionsRemaining <= 0 || current.winner || current.pendingAction) break;
             if (move.action === 'END_TURN') break;
+            
             if (move.cardId) {
               const canPlay = current.players[current.activePlayerIndex].hand.some(c => c.id === move.cardId);
               if (canPlay) {
@@ -444,14 +592,91 @@ const App: React.FC = () => {
             }
           }
         } finally {
-          endTurn();
-          setIsProcessing(false);
-          aiProcessingRef.current = false;
+           const current = gameStateRef.current;
+           if (current && !current.winner && !current.pendingAction) {
+             endTurn();
+           }
+           setIsProcessing(false);
+           aiProcessingRef.current = false;
         }
       };
       runAI();
     }
   }, [gameState?.activePlayerIndex, gameState?.phase, executeMove, endTurn, gameState?.winner, gameState?.pendingAction]);
+
+  // AI JSN Logic (Auto-Defend and Auto-Counter)
+  const pendingJsnStack = gameState?.pendingAction?.jsnStack ?? 0;
+  
+  useEffect(() => {
+    if (!gameState || !gameState.pendingAction) return;
+
+    const jsnStack = gameState.pendingAction.jsnStack || 0;
+    const isDefenderTurn = jsnStack % 2 === 0;
+    const playerIndex = isDefenderTurn ? (1 - gameState.pendingAction.attackerIndex) : gameState.pendingAction.attackerIndex;
+    const player = gameState.players[playerIndex];
+
+    if (player.isAI) {
+       const hasJSN = player.hand.some(c => c.name === 'Just Say No');
+       const timer = setTimeout(() => {
+         // AI always uses JSN if it has it to block/counter
+         resolvePendingAction(hasJSN);
+       }, 2000);
+       return () => clearTimeout(timer);
+    }
+  }, [pendingJsnStack, resolvePendingAction, gameState]);
+
+  // Helper for Fan Stack (Hand-like)
+  const renderFanStack = (cards: Card[], size: 'sm' | 'md' = 'sm', className?: string) => {
+    if (cards.length === 0) {
+      return (
+        <div className={`border-2 border-white/5 rounded-lg flex items-center justify-center opacity-20 ${size === 'md' ? 'w-24 h-36' : 'w-16 h-24'} ${className}`}>
+           <span className="text-[9px]">EMPTY</span>
+        </div>
+      );
+    }
+    
+    const count = cards.length;
+    // Fan spread calculation (Hand-like arc)
+    const maxSpread = 45; // reduced spread for tighter fan
+    const spacing = Math.min(maxSpread / (count > 1 ? count - 1 : 1), 15);
+    const totalSpread = (count - 1) * spacing;
+    const startAngle = -totalSpread / 2;
+
+    return (
+      <div className={`relative group cursor-pointer ${className}`} style={{ width: size === 'md' ? '120px' : '80px', height: size === 'md' ? '160px' : '110px' }}>
+        {cards.map((card, i) => {
+          const angle = startAngle + (i * spacing);
+          const isTop = i === count - 1;
+          
+          return (
+            <div 
+              key={card.id} 
+              className="absolute bottom-0 left-1/2 origin-bottom transition-transform duration-300"
+              style={{ 
+                zIndex: i,
+                transform: `translateX(-50%) rotate(${angle}deg) translateY(${i * -1}px)`,
+              }}
+            >
+              <CardUI 
+                card={card} 
+                size={size} 
+                // Only top card has full shadow to prevent accumulation, but all are opaque.
+                // Lower cards are slightly dimmed via brightness filter for depth.
+                className={`${isTop ? 'shadow-xl brightness-100' : 'shadow-none brightness-90'} border-slate-900/10`} 
+                disabled // Used for interaction logic (no internal hover), opacity handled by lack of opacity class
+              />
+            </div>
+          );
+        })}
+        {/* Total Value Badge for stacks */}
+        <div className="absolute -bottom-1 left-1/2 -translate-x-1/2 z-[60] opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
+           <span className="bg-slate-900/90 px-2 py-0.5 rounded text-[10px] font-bold text-white border border-white/20 whitespace-nowrap shadow-xl">
+             {cards.length} Cards
+           </span>
+        </div>
+      </div>
+    );
+  };
 
   if (!gameState) {
     return (
@@ -505,10 +730,20 @@ const App: React.FC = () => {
     return set.color === pendingRentCard.color || set.color === pendingRentCard.secondaryColor;
   };
 
-  const showJSNPrompt = gameState.pendingAction && 
-    (gameState.multiplayerRole 
-      ? (gameState.multiplayerRole === 'HOST' ? gameState.pendingAction.attackerIndex === 1 : gameState.pendingAction.attackerIndex === 0)
-      : true);
+  // Determine who needs to respond to JSN
+  const jsnStack = gameState.pendingAction?.jsnStack || 0;
+  const isJsnResponderTurn = jsnStack % 2 === 0 ? (1 - (gameState.pendingAction?.attackerIndex || 0)) === myIndex : (gameState.pendingAction?.attackerIndex || 0) === myIndex;
+  const showJSNPrompt = gameState.pendingAction && isJsnResponderTurn && !me.isAI;
+
+  const responderName = jsnStack % 2 === 0 ? gameState.players[1 - (gameState.pendingAction?.attackerIndex||0)].name : gameState.players[gameState.pendingAction?.attackerIndex||0].name;
+
+  // Force Deal Helpers
+  const isForceDealMyTurn = !!pendingForceDeal;
+  const isSelectingMySet = isForceDealMyTurn && pendingForceDeal.mySetIndex === undefined;
+  const isSelectingOppSet = isForceDealMyTurn && pendingForceDeal.mySetIndex !== undefined;
+
+  // Sly Deal Helpers
+  const isSlyDealMyTurn = !!pendingSlyDeal;
 
   return (
     <div className="h-screen bg-[#020617] flex flex-col overflow-hidden select-none text-slate-200">
@@ -541,38 +776,75 @@ const App: React.FC = () => {
               <div className="w-10 h-10 rounded-full bg-slate-800 flex items-center justify-center border border-white/10"><i className="fa-solid fa-user-circle text-slate-400"></i></div>
               <span className="font-black text-xl tracking-tight uppercase opacity-50">{them.name}</span>
             </div>
-            <div className="flex gap-4">
-               <div className="bg-emerald-500/10 px-4 py-2 rounded-2xl border-2 border-emerald-500/20 text-emerald-500/70 font-black text-xl shadow-lg">{them.bank.reduce((s, c) => s + c.value, 0)}M</div>
-               <div className="bg-amber-500/5 px-3 py-1 rounded-xl border border-amber-500/10 text-amber-500/60 font-bold text-sm">{them.properties.filter(p => p.isComplete).length}/3 SETS</div>
+            <div className="flex gap-4 items-center">
+               {renderFanStack(them.bank, 'sm')}
+               <div className="bg-amber-500/5 px-3 py-1 rounded-xl border border-amber-500/10 text-amber-500/60 font-bold text-sm h-fit">{them.properties.filter(p => p.isComplete).length}/3 SETS</div>
             </div>
           </div>
-          <div className="grid grid-cols-2 lg:grid-cols-3 gap-4 mb-8">
-            {them.properties.map((set, i) => (
-              <div key={i} className={`relative p-2 rounded-2xl bg-white/5 border transition-all ${set.isComplete ? 'border-amber-400 shadow-[0_0_25px_rgba(251,191,36,0.2)] bg-amber-500/5 scale-[1.02]' : 'border-white/5'}`}>
+          <div className="grid grid-cols-2 lg:grid-cols-3 gap-8 mb-8">
+            {them.properties.map((set, i) => {
+              const isTargetableFD = isSelectingOppSet && !set.isComplete;
+              const isTargetableSD = isSlyDealMyTurn && !set.isComplete;
+              return (
+              <div 
+                key={i} 
+                onClick={() => {
+                   if (isTargetableFD) initiateForceDeal(i);
+                   if (isTargetableSD) initiateSlyDeal(i);
+                }}
+                className={`relative p-2 rounded-2xl transition-all 
+                  ${set.isComplete ? 'scale-[1.02]' : ''}
+                  ${(isTargetableFD || isTargetableSD) ? 'ring-4 ring-amber-500 cursor-pointer animate-pulse z-30' : ''}
+                  ${(isSelectingOppSet || isSlyDealMyTurn) && !(isTargetableFD || isTargetableSD) ? 'opacity-30' : ''}
+                `}
+              >
                  {set.isComplete && (
-                   <div className="absolute -top-2 -right-2 w-6 h-6 bg-amber-500 rounded-full flex items-center justify-center shadow-lg z-10 animate-bounce">
-                     <i className="fa-solid fa-check text-white text-[10px]"></i>
+                   <div className="absolute -top-2 -right-2 w-8 h-8 bg-amber-500 rounded-full flex items-center justify-center shadow-lg z-10 animate-bounce">
+                     <i className="fa-solid fa-check text-white text-xs"></i>
                    </div>
                  )}
-                 <div className="flex -space-x-12 transition-all duration-500 overflow-visible h-28 items-center justify-center">
-                    {set.cards.map(c => <CardUI key={c.id} card={c} size="sm" className="shadow-xl" disabled />)}
+                 <div className="flex items-center justify-center h-36">
+                    {renderFanStack(set.cards, 'md', 'mx-auto')}
                  </div>
-                 {set.isComplete && <div className="text-center text-[8px] font-black text-amber-500 uppercase tracking-widest pb-1">Full Set</div>}
+                 {set.isComplete && <div className="text-center text-[10px] font-black text-amber-500 uppercase tracking-widest pb-1 mt-2">Full Set</div>}
               </div>
-            ))}
+              );
+            })}
           </div>
         </div>
 
-        {/* Center: Deck */}
-        <div className="w-24 flex flex-col items-center justify-center gap-8 py-10">
-          <div className="relative group cursor-help">
-            <div className="w-16 h-24 bg-blue-700 rounded-xl border-2 border-white/20 shadow-2xl transform rotate-3 translate-x-1"></div>
-            <div className="absolute top-0 w-16 h-24 bg-blue-600 rounded-xl border-2 border-white/40 shadow-2xl flex items-center justify-center -rotate-2">
-              <span className="font-black text-xl text-white">{gameState.deck.length}</span>
+        {/* Center: Deck & Discard */}
+        <div className="w-32 flex flex-col items-center justify-center gap-8 py-10 z-0">
+          {/* Draw Pile */}
+          <div className="relative group cursor-pointer">
+            <div className="w-24 h-36 bg-blue-800 rounded-xl border border-white/10 shadow-xl absolute top-1 left-1 rotate-3"></div>
+            <div className="w-24 h-36 bg-blue-700 rounded-xl border border-white/10 shadow-xl absolute top-0.5 left-0.5 -rotate-2"></div>
+            <div className="relative w-24 h-36 bg-gradient-to-br from-blue-600 to-blue-700 rounded-xl border border-white/20 shadow-2xl flex items-center justify-center">
+              <span className="font-black text-3xl text-white drop-shadow-md">{gameState.deck.length}</span>
             </div>
           </div>
-          <div className="w-16 h-24 rounded-xl border-2 border-dashed border-white/5 flex items-center justify-center p-2 text-center text-[10px] font-black text-white/10 uppercase tracking-tighter italic text-clip overflow-hidden">
-            {gameState.discardPile.length > 0 ? gameState.discardPile[gameState.discardPile.length - 1].name : 'Discard'}
+
+          {/* Discard Pile - Showing only the latest card with entrance animation */}
+          <div className="relative w-32 h-48 flex items-center justify-center">
+            {gameState.discardPile.length > 0 ? (
+              <div 
+                key={gameState.discardPile[gameState.discardPile.length - 1].id} 
+                className="animate-in zoom-in-50 slide-in-from-bottom-24 duration-500 absolute inset-0"
+              >
+                 {/* Added shadow-2xl manually since default was removed */}
+                 <CardUI card={gameState.discardPile[gameState.discardPile.length - 1]} size="lg" className="shadow-2xl" disabled />
+                 {/* Pass Go Animation Overlay */}
+                 {gameState.discardPile[gameState.discardPile.length - 1].name === 'Pass Go' && (
+                   <div className="absolute -top-12 left-1/2 -translate-x-1/2 whitespace-nowrap z-50 animate-bounce">
+                     <span className="text-3xl font-black text-transparent bg-clip-text bg-gradient-to-r from-yellow-400 to-amber-600 drop-shadow-[0_2px_2px_rgba(0,0,0,0.8)]">+2 CARDS!</span>
+                   </div>
+                 )}
+              </div>
+            ) : (
+              <div className="w-24 h-36 rounded-xl border-2 border-dashed border-white/5 flex items-center justify-center">
+                 <span className="text-xs font-black text-white/10 uppercase -rotate-45">Discard</span>
+              </div>
+            )}
           </div>
         </div>
 
@@ -582,27 +854,34 @@ const App: React.FC = () => {
             <div className="flex items-center gap-3">
               <div className={`w-10 h-10 rounded-full flex items-center justify-center border transition-all ${isMyTurn ? 'bg-blue-600 border-blue-400 shadow-[0_0_15px_rgba(37,99,235,0.3)]' : 'bg-slate-800 border-white/10'}`}><i className={`fa-solid fa-user ${isMyTurn ? 'text-white' : 'text-slate-500'}`}></i></div>
               <span className="font-black text-xl tracking-tight uppercase tracking-widest">
-                {pendingRentCard ? 'Select Rent Target' : isMyTurn ? 'Your Strategy' : 'Opponent Thinking'}
+                {pendingRentCard ? 'Select Rent Target' : pendingForceDeal ? 'Force Deal Mode' : pendingSlyDeal ? 'Sly Deal Mode' : isMyTurn ? 'Your Strategy' : 'Opponent Thinking'}
               </span>
             </div>
-            <div className="flex gap-4">
-               <div className="bg-emerald-500/20 px-4 py-2 rounded-2xl border-2 border-emerald-500/40 text-emerald-400 font-black text-xl shadow-[0_0_20px_rgba(16,185,129,0.1)]">{me.bank.reduce((s, c) => s + c.value, 0)}M</div>
-               <div className="bg-amber-500/10 px-3 py-1 rounded-xl border border-amber-500/20 text-amber-400 font-bold text-sm">{me.properties.filter(p => p.isComplete).length}/3 SETS</div>
+            <div className="flex gap-4 items-center">
+               {renderFanStack(me.bank, 'sm')}
+               <div className="bg-amber-500/10 px-3 py-1 rounded-xl border border-amber-500/20 text-amber-400 font-bold text-sm h-fit">{me.properties.filter(p => p.isComplete).length}/3 SETS</div>
             </div>
           </div>
           
-          <div className="grid grid-cols-2 lg:grid-cols-3 gap-6 mb-8 flex-1">
+          <div className="grid grid-cols-2 lg:grid-cols-3 gap-8 mb-8 flex-1">
             {me.properties.map((set, i) => {
-              const isValid = isValidRentTarget(set);
+              const isRentValid = isValidRentTarget(set);
+              const isForceDealSource = isSelectingMySet && !set.isComplete;
+              const isClickable = isRentValid || isForceDealSource;
+              
               return (
                 <div 
                   key={i} 
-                  onClick={() => isValid && handleRentCollection(i)}
-                  className={`relative p-3 rounded-2xl bg-white/5 border transition-all cursor-pointer
-                    ${set.isComplete ? 'border-amber-400 shadow-[0_0_35px_rgba(251,191,36,0.3)] bg-amber-500/5 scale-[1.02]' : 'border-white/10'}
-                    ${pendingRentCard && !isValid ? 'opacity-20 grayscale' : ''}
-                    ${isValid ? 'ring-4 ring-amber-500 ring-offset-4 ring-offset-[#020617] animate-pulse z-30' : ''}
-                    hover:bg-white/10
+                  onClick={() => {
+                     if (isRentValid) handleRentCollection(i);
+                     if (isForceDealSource) setPendingForceDeal(prev => ({...prev!, mySetIndex: i}));
+                  }}
+                  className={`relative p-2 rounded-2xl transition-all cursor-pointer
+                    ${set.isComplete ? 'scale-[1.02]' : ''}
+                    ${pendingRentCard && !isRentValid ? 'opacity-20 grayscale' : ''}
+                    ${pendingForceDeal && !isForceDealSource && isSelectingMySet ? 'opacity-20 grayscale' : ''}
+                    ${isClickable ? 'ring-4 ring-amber-500 ring-offset-4 ring-offset-[#020617] animate-pulse z-30' : ''}
+                    hover:bg-white/5
                   `}
                 >
                   {set.isComplete && (
@@ -610,14 +889,21 @@ const App: React.FC = () => {
                       <i className="fa-solid fa-crown text-white text-xs"></i>
                     </div>
                   )}
-                  {isValid && (
+                  {isRentValid && (
                     <div className="absolute inset-0 bg-amber-500/10 rounded-2xl flex items-center justify-center z-20">
                       <span className="font-black text-xs text-amber-400 bg-slate-900 px-3 py-1 rounded-full border border-amber-400 uppercase tracking-widest shadow-xl">Collect Here</span>
                     </div>
                   )}
-                  <div className="flex -space-x-12 hover:space-x-2 transition-all duration-500 pb-2 overflow-visible h-32 items-center justify-center">
-                      {set.cards.map(c => <CardUI key={c.id} card={c} size="sm" className="shadow-2xl" disabled />)}
+                  {isForceDealSource && (
+                    <div className="absolute inset-0 bg-blue-500/10 rounded-2xl flex items-center justify-center z-20">
+                      <span className="font-black text-xs text-blue-400 bg-slate-900 px-3 py-1 rounded-full border border-blue-400 uppercase tracking-widest shadow-xl">Swap This</span>
+                    </div>
+                  )}
+                  
+                  <div className="flex items-center justify-center h-36">
+                    {renderFanStack(set.cards, 'md', 'mx-auto')}
                   </div>
+
                   <div className="absolute bottom-2 right-3 text-[10px] font-black text-white/10 uppercase tracking-widest">{set.color}</div>
                 </div>
               );
@@ -631,9 +917,11 @@ const App: React.FC = () => {
                <CardUI 
                  key={card.id} 
                  card={card} 
+                 // Added shadow-xl manually since default was removed
+                 className="shadow-xl"
                  selected={selectedCardId === card.id} 
                  onClick={() => handleCardClick(card.id)} 
-                 disabled={!isMyTurn || isProcessing || gameState.actionsRemaining <= 0 || !!pendingRentCard || !!gameState.pendingAction} 
+                 disabled={!isMyTurn || isProcessing || gameState.actionsRemaining <= 0 || !!pendingRentCard || !!gameState.pendingAction || !!pendingForceDeal || !!pendingSlyDeal} 
                />
              )) : (
                 <div className="flex flex-col items-center gap-4 opacity-40">
@@ -654,7 +942,12 @@ const App: React.FC = () => {
                 <i className="fa-solid fa-hand-paper text-amber-500 text-3xl"></i>
              </div>
              <h3 className="text-2xl font-black text-white mb-2 uppercase tracking-tighter italic">{gameState.players[gameState.pendingAction!.attackerIndex].name} is playing {gameState.pendingAction!.card.name}!</h3>
-             <p className="text-slate-400 font-bold mb-8 uppercase text-xs tracking-widest leading-relaxed">Do you want to use a "Just Say No" card to block this move?</p>
+             <div className="mb-8">
+               <p className="text-slate-400 font-bold uppercase text-xs tracking-widest leading-relaxed">
+                 {responderName === me.name ? "Do you want to use a 'Just Say No' card?" : `${responderName}, use a 'Just Say No' card?`}
+               </p>
+               {jsnStack > 0 && <p className="text-amber-500 text-xs font-bold mt-2">JSN CHAIN ACTIVE: {jsnStack}</p>}
+             </div>
              <div className="flex flex-col gap-3">
                {me.hand.some(c => c.name === 'Just Say No') && (
                  <button onClick={() => resolvePendingAction(true)} className="w-full py-4 bg-amber-500 text-slate-950 font-black rounded-2xl hover:scale-105 transition active:scale-95 shadow-xl uppercase tracking-widest">USE JUST SAY NO</button>
@@ -672,6 +965,20 @@ const App: React.FC = () => {
             <span className="font-black text-amber-500 text-xl italic uppercase tracking-tighter animate-pulse">Choose a Property Set to Collect Rent</span>
             <button onClick={() => { me.hand.push(pendingRentCard); setPendingRentCard(null); }} className="px-6 py-2 bg-slate-800 hover:bg-slate-700 rounded-xl font-bold text-xs">CANCEL ACTION</button>
           </div>
+        ) : pendingForceDeal ? (
+          <div className="animate-in fade-in zoom-in duration-300 flex items-center gap-8">
+            <span className="font-black text-blue-400 text-xl italic uppercase tracking-tighter animate-pulse">
+              {pendingForceDeal.mySetIndex === undefined ? 'Select YOUR Property to Swap' : 'Select OPPONENT Property to Swap'}
+            </span>
+            <button onClick={() => { me.hand.push(pendingForceDeal.card); setPendingForceDeal(null); }} className="px-6 py-2 bg-slate-800 hover:bg-slate-700 rounded-xl font-bold text-xs">CANCEL ACTION</button>
+          </div>
+        ) : pendingSlyDeal ? (
+          <div className="animate-in fade-in zoom-in duration-300 flex items-center gap-8">
+            <span className="font-black text-emerald-400 text-xl italic uppercase tracking-tighter animate-pulse">
+              Select OPPONENT Property to Steal
+            </span>
+            <button onClick={() => { me.hand.push(pendingSlyDeal.card); setPendingSlyDeal(null); }} className="px-6 py-2 bg-slate-800 hover:bg-slate-700 rounded-xl font-bold text-xs">CANCEL ACTION</button>
+          </div>
         ) : selectedCardId && isMyTurn && gameState.actionsRemaining > 0 ? (
           <div className="flex items-center gap-4 animate-in slide-in-from-bottom-8 duration-500">
             <button onClick={() => executeMove('BANK', selectedCardId)} className="px-10 py-4 bg-emerald-600 hover:bg-emerald-500 text-white rounded-2xl font-black shadow-xl transition active:scale-95 border-b-4 border-emerald-800 flex items-center gap-3"><i className="fa-solid fa-piggy-bank"></i> BANK</button>
@@ -682,7 +989,7 @@ const App: React.FC = () => {
         ) : (
           <button 
             onClick={endTurn} 
-            disabled={!isMyTurn || isProcessing || gameState.phase !== 'PLAY_PHASE' || !!pendingRentCard || !!gameState.pendingAction} 
+            disabled={!isMyTurn || isProcessing || gameState.phase !== 'PLAY_PHASE' || !!pendingRentCard || !!gameState.pendingAction || !!pendingForceDeal || !!pendingSlyDeal} 
             className={`group relative px-20 py-5 bg-gradient-to-r from-red-600 to-red-800 hover:from-red-500 hover:to-red-700 disabled:opacity-10 text-white rounded-2xl font-black tracking-[0.4em] shadow-2xl transition-all active:scale-95 border-b-4 border-red-900 overflow-hidden
               ${isMyTurn && gameState.actionsRemaining <= 0 ? 'animate-pulse scale-105 ring-4 ring-red-500/30' : ''}
             `}

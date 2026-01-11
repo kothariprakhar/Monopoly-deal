@@ -1,3 +1,4 @@
+
 export type PropertyColor = 
   | 'BROWN' 
   | 'LIGHT_BLUE' 
@@ -45,6 +46,9 @@ export interface PendingAction {
   card: Card;
   attackerIndex: number;
   targetIndex?: number; // For single target actions
+  targetSetIndex?: number;
+  mySetIndex?: number;
+  jsnStack?: number; // 0 = Action Active, 1 = Blocked by JSN, 2 = Countered JSN (Active), etc.
 }
 
 export interface GameState {

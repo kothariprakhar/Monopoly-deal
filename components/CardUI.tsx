@@ -1,4 +1,3 @@
-
 import React from 'react';
 import { Card, COLOR_MAP, RENT_VALUES, SET_LIMITS } from '../types';
 
@@ -43,13 +42,22 @@ const CardUI: React.FC<CardUIProps> = ({ card, onClick, selected, disabled, clas
       onClick={!disabled ? onClick : undefined}
       className={`
         ${sizeClasses[size]}
-        relative rounded-md border-2 shadow-lg cursor-pointer transition-all duration-300 transform
-        ${selected ? '-translate-y-4 ring-4 ring-blue-500 scale-105 z-10' : 'hover:-translate-y-2'}
+        relative rounded-md border-2 transition-all duration-300
+        ${selected && !disabled ? '-translate-y-4 ring-4 ring-blue-500 scale-105 z-10 shadow-2xl' : ''}
+        ${!selected && !disabled ? 'hover:-translate-y-2 cursor-pointer' : ''}
         ${isHighlighted ? 'ring-4 ring-amber-400 animate-pulse scale-110 z-20' : ''}
-        ${disabled ? 'opacity-40 grayscale-[0.5] cursor-not-allowed' : ''}
+        ${disabled ? 'cursor-default' : ''}
         ${getCardStyle()}
         ${className || ''}
+        backface-hidden
       `}
+      style={{
+        transformStyle: 'preserve-3d',
+        backfaceVisibility: 'hidden',
+        WebkitFontSmoothing: 'antialiased',
+        MozOsxFontSmoothing: 'grayscale',
+        transform: 'translateZ(0)'
+      }}
     >
       {/* Property/Rent Header */}
       {(card.type === 'PROPERTY' || card.type === 'WILD' || card.type === 'RENT') && card.color && (
