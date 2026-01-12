@@ -150,7 +150,7 @@ const App: React.FC = () => {
       remaining -= card.value;
       log.unshift(`${fromPlayer.name} paid ${card.name} (${card.value}M) from bank.`);
       if (remaining < 0) {
-        log.unshift(`Note: No change is given in Monopoly Deal!`);
+        log.unshift(`Note: No change is given in MonoDeal!`);
       }
     }
     
@@ -684,8 +684,8 @@ const App: React.FC = () => {
         <div className="relative mb-12 group">
           <div className="absolute -inset-1 bg-gradient-to-r from-amber-600 to-blue-600 rounded-3xl blur opacity-25 group-hover:opacity-50 transition duration-1000"></div>
           <div className="relative bg-slate-900 px-12 py-8 rounded-3xl border border-white/10 text-center">
-            <h1 className="text-6xl font-black mb-2 text-transparent bg-clip-text bg-gradient-to-br from-yellow-300 via-amber-500 to-orange-600 tracking-tighter italic">MONOPOLY DEAL</h1>
-            <p className="text-slate-500 font-bold uppercase tracking-[0.5em] text-xs">Global Digital Edition</p>
+            <h1 className="text-6xl font-black mb-2 text-transparent bg-clip-text bg-gradient-to-br from-yellow-300 via-amber-500 to-orange-600 tracking-tighter italic">MONODEAL</h1>
+            <p className="text-slate-500 font-bold uppercase tracking-[0.5em] text-xs">ChunkyMonkey Digital Edition</p>
           </div>
         </div>
         {lobbyMode === 'MAIN' && (
@@ -716,7 +716,26 @@ const App: React.FC = () => {
     );
   }
 
-  const myIndex = (gameState.multiplayerRole === 'JOINER') ? 1 : 0;
+  // Determine role/view based on Multiplayer or Local Play status
+  const isMultiplayer = !!gameState.multiplayerRole;
+  
+  let viewIndex = 0;
+  if (isMultiplayer) {
+      viewIndex = gameState.multiplayerRole === 'JOINER' ? 1 : 0;
+  } else {
+      // Local Play Logic: View follows action
+      if (gameState.pendingAction) {
+          const stack = gameState.pendingAction.jsnStack || 0;
+          const att = gameState.pendingAction.attackerIndex;
+          // Even stack: Opponent of attacker responds
+          // Odd stack: Attacker responds (counter)
+          viewIndex = stack % 2 === 0 ? (1 - att) : att;
+      } else {
+          viewIndex = gameState.activePlayerIndex;
+      }
+  }
+
+  const myIndex = viewIndex;
   const opponentIndex = 1 - myIndex;
   
   const me = gameState.players[myIndex];
@@ -732,10 +751,28 @@ const App: React.FC = () => {
 
   // Determine who needs to respond to JSN
   const jsnStack = gameState.pendingAction?.jsnStack || 0;
-  const isJsnResponderTurn = jsnStack % 2 === 0 ? (1 - (gameState.pendingAction?.attackerIndex || 0)) === myIndex : (gameState.pendingAction?.attackerIndex || 0) === myIndex;
-  const showJSNPrompt = gameState.pendingAction && isJsnResponderTurn && !me.isAI;
+  // Explicitly calculate responder index based on stack depth
+  const realResponderIndex = jsnStack % 2 === 0 ? (1 - (gameState.pendingAction?.attackerIndex || 0)) : (gameState.pendingAction?.attackerIndex || 0);
+  
+  // Show prompt if:
+  // 1. Action is pending
+  // 2. The current view (me) is the responder
+  // 3. The responder is not AI
+  const showJSNPrompt = gameState.pendingAction && (realResponderIndex === myIndex) && !me.isAI;
 
-  const responderName = jsnStack % 2 === 0 ? gameState.players[1 - (gameState.pendingAction?.attackerIndex||0)].name : gameState.players[gameState.pendingAction?.attackerIndex||0].name;
+  const responderName = gameState.players[realResponderIndex].name;
+  
+  // Text for JSN Modal
+  const getJsnPromptText = () => {
+     if (!gameState.pendingAction) return "";
+     const attackerName = gameState.players[gameState.pendingAction.attackerIndex].name;
+     if (jsnStack === 0) {
+        return `${attackerName} is playing ${gameState.pendingAction.card.name}!`;
+     } else {
+        const prevPlayer = gameState.players[1 - realResponderIndex].name;
+        return `${prevPlayer} used JUST SAY NO!`;
+     }
+  };
 
   // Force Deal Helpers
   const isForceDealMyTurn = !!pendingForceDeal;
@@ -770,7 +807,7 @@ const App: React.FC = () => {
       <div className="flex-1 flex p-4 gap-4 overflow-hidden relative">
         
         {/* Left Panel: Opponent Assets (Them) */}
-        <div className={`flex-1 flex flex-col rounded-[2.5rem] p-6 transition-all duration-700 overflow-y-auto custom-scrollbar bg-slate-900/40 border border-white/5 ${!isMyTurn ? 'ring-2 ring-amber-500/30' : ''}`}>
+        <div className={`flex-1 flex flex-col rounded-[2.5rem] p-6 transition-all duration-700 overflow-y-auto custom-scrollbar bg-slate-900/40 border border-white/5 ${!isMyTurn && !showJSNPrompt ? 'ring-2 ring-amber-500/30' : ''}`}>
           <div className="flex justify-between items-center mb-6">
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 rounded-full bg-slate-800 flex items-center justify-center border border-white/10"><i className="fa-solid fa-user-circle text-slate-400"></i></div>
@@ -835,7 +872,10 @@ const App: React.FC = () => {
                  <CardUI card={gameState.discardPile[gameState.discardPile.length - 1]} size="lg" className="shadow-2xl" disabled />
                  {/* Pass Go Animation Overlay */}
                  {gameState.discardPile[gameState.discardPile.length - 1].name === 'Pass Go' && (
-                   <div className="absolute -top-12 left-1/2 -translate-x-1/2 whitespace-nowrap z-50 animate-bounce">
+                   <div 
+                     className="absolute -top-12 left-1/2 -translate-x-1/2 whitespace-nowrap z-50"
+                     style={{ animation: 'bounce 1s infinite, fadeOut 2s forwards' }}
+                   >
                      <span className="text-3xl font-black text-transparent bg-clip-text bg-gradient-to-r from-yellow-400 to-amber-600 drop-shadow-[0_2px_2px_rgba(0,0,0,0.8)]">+2 CARDS!</span>
                    </div>
                  )}
@@ -849,12 +889,12 @@ const App: React.FC = () => {
         </div>
 
         {/* Right Panel: Your Assets (Me) */}
-        <div className={`flex-1 flex flex-col rounded-[2.5rem] p-6 transition-all duration-700 overflow-y-auto custom-scrollbar ${isMyTurn ? 'bg-blue-600/5 border border-blue-500/30 ring-2 ring-blue-500/20' : 'bg-slate-900/40 border border-white/5'}`}>
+        <div className={`flex-1 flex flex-col rounded-[2.5rem] p-6 transition-all duration-700 overflow-y-auto custom-scrollbar ${isMyTurn || showJSNPrompt ? 'bg-blue-600/5 border border-blue-500/30 ring-2 ring-blue-500/20' : 'bg-slate-900/40 border border-white/5'}`}>
           <div className="flex justify-between items-center mb-6">
             <div className="flex items-center gap-3">
-              <div className={`w-10 h-10 rounded-full flex items-center justify-center border transition-all ${isMyTurn ? 'bg-blue-600 border-blue-400 shadow-[0_0_15px_rgba(37,99,235,0.3)]' : 'bg-slate-800 border-white/10'}`}><i className={`fa-solid fa-user ${isMyTurn ? 'text-white' : 'text-slate-500'}`}></i></div>
+              <div className={`w-10 h-10 rounded-full flex items-center justify-center border transition-all ${isMyTurn || showJSNPrompt ? 'bg-blue-600 border-blue-400 shadow-[0_0_15px_rgba(37,99,235,0.3)]' : 'bg-slate-800 border-white/10'}`}><i className={`fa-solid fa-user ${isMyTurn || showJSNPrompt ? 'text-white' : 'text-slate-500'}`}></i></div>
               <span className="font-black text-xl tracking-tight uppercase tracking-widest">
-                {pendingRentCard ? 'Select Rent Target' : pendingForceDeal ? 'Force Deal Mode' : pendingSlyDeal ? 'Sly Deal Mode' : isMyTurn ? 'Your Strategy' : 'Opponent Thinking'}
+                {pendingRentCard ? 'Select Rent Target' : pendingForceDeal ? 'Force Deal Mode' : pendingSlyDeal ? 'Sly Deal Mode' : isMyTurn ? 'Your Strategy' : (showJSNPrompt ? 'Countering...' : 'Opponent Thinking')}
               </span>
             </div>
             <div className="flex gap-4 items-center">
@@ -926,7 +966,7 @@ const App: React.FC = () => {
              )) : (
                 <div className="flex flex-col items-center gap-4 opacity-40">
                   <div className="flex gap-2 animate-pulse">{[1,2,3].map(i => <div key={i} className="w-10 h-16 bg-slate-800 rounded-lg border border-slate-700" />)}</div>
-                  <span className="text-xs font-black uppercase tracking-[0.4em] text-slate-500 animate-pulse">Waiting for opponent...</span>
+                  <span className="text-xs font-black uppercase tracking-[0.4em] text-slate-500 animate-pulse">{showJSNPrompt ? 'WAITING FOR INPUT...' : 'WAITING FOR OPPONENT...'}</span>
                 </div>
              )}
           </div>
@@ -941,7 +981,7 @@ const App: React.FC = () => {
              <div className="w-20 h-20 bg-amber-500/20 rounded-full flex items-center justify-center mx-auto mb-6 border-2 border-amber-500">
                 <i className="fa-solid fa-hand-paper text-amber-500 text-3xl"></i>
              </div>
-             <h3 className="text-2xl font-black text-white mb-2 uppercase tracking-tighter italic">{gameState.players[gameState.pendingAction!.attackerIndex].name} is playing {gameState.pendingAction!.card.name}!</h3>
+             <h3 className="text-2xl font-black text-white mb-2 uppercase tracking-tighter italic">{getJsnPromptText()}</h3>
              <div className="mb-8">
                <p className="text-slate-400 font-bold uppercase text-xs tracking-widest leading-relaxed">
                  {responderName === me.name ? "Do you want to use a 'Just Say No' card?" : `${responderName}, use a 'Just Say No' card?`}
